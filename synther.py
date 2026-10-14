@@ -334,7 +334,7 @@ class SimpleDiffusionGenerator:
         self.dim = 2 * self.obs_dim + self.act_dim + 2
         self.device = device
         self.terminal_threshold = terminal_threshold
-        self.model = None  # EMA model, set by retrain()
+        self.model = None
         self.ema_model = None
         self.actual_model = None
 
@@ -344,7 +344,7 @@ class SimpleDiffusionGenerator:
             d["obs"].reshape(-1, o),
             d["action"].reshape(-1, a),
             d["reward"].reshape(-1, 1),
-            d["next_obs"].reshape(-1, o),
+            (d["next_obs"] - d["obs"]).reshape(-1, o), # diffusion over delta obs
             d["terminated"].reshape(-1, 1).float(),
         ], dim=-1).float()
 
@@ -482,8 +482,9 @@ class SimpleDiffusionGenerator:
         obs = s[:, :o]
         act = s[:, o:o + a]
         rew = s[:, o + a]
-        next_obs = s[:, o + a + 1:2 * o + a + 1]
+        delta = s[:, o + a + 1:o + a + 13]
         term = s[:, -1]
+        next_obs = obs + delta
         if self.terminal_threshold is not None:
             term = (term > self.terminal_threshold).astype(np.float32)
         return obs, act, rew, next_obs, term

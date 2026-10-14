@@ -142,7 +142,7 @@ class SoftQNetwork(torch.nn.Module):
 
 def make_env():
     return TargetAviary(
-        trajectory_generator=StaticTargetStateGenerator(xyz=INIT_XYZ, randomize=False),
+        target_state_generator=StaticTargetStateGenerator(xyz=INIT_XYZ, randomize=False),
         init_state_generator=DroneStateGenerator(init_xyz=INIT_XYZ, randomize=True),
         max_t=10,
         act=ACT,
@@ -244,7 +244,7 @@ if __name__ == "__main__":
         if global_step >= WARMUP_LENGTH:
             # 2.1) SynthER update
             if ENABLE_SYNTHETIC and global_step >= SYNTHER_STARTS and global_step % SYNTHER_FREQ == 0:
-
+                
                 if synthetic_buffer is None:
                     synthetic_buffer = RolloutBuffer(
                         max_steps = SYNTHETIC_SAMPLES,
