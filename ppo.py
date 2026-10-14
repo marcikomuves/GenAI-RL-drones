@@ -7,8 +7,8 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from gym_pybullet_drones.utils.enums import ActionType, DroneModel, Physics
 import gymnasium as gym
-from trajectoryaviary import TrajectoryAviary
-from trajectorygenerator import StaticTrajectory
+from targetaviary import TargetAviary
+from targetstategenerator import StaticTargetStateGenerator
 from dronestategenerator import DroneStateGenerator
 from rolloutbuffer import RolloutBuffer
 
@@ -90,8 +90,8 @@ class Critic(torch.nn.Module):
 
 
 def make_env():
-    return TrajectoryAviary(
-        trajectory_generator=StaticTrajectory(xyz=INIT_XYZ, randomize=False),
+    return TargetAviary(
+        trajectory_generator=StaticTargetStateGenerator(xyz=INIT_XYZ, randomize=False),
         init_state_generator=DroneStateGenerator(init_xyz=INIT_XYZ, randomize=False),
         max_t=10, 
         act=ACT, 

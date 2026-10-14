@@ -7,49 +7,71 @@ import itertools
 from torch.utils.tensorboard import SummaryWriter
 from gym_pybullet_drones.utils.enums import ActionType, DroneModel, Physics
 import gymnasium as gym
-from trajectoryaviary import TrajectoryAviary
-from trajectorygenerator import StaticTrajectory
+from targetaviary import TargetAviary
+from targetstategenerator import StaticTargetStateGenerator
 from dronestategenerator import DroneStateGenerator
 from rolloutbuffer import RolloutBuffer
 from synther import SimpleDiffusionGenerator
+import argparse
 
-# environment params
+parser = argparse.ArgumentParser()
+parser.add_argument("--run-name", required=True)
+parser.add_argument("--n", type=int, default=2)
+parser.add_argument("--m", type=int, default=2)
+parser.add_argument("--utd", type=int, default=1)
+parser.add_argument("--synthetic", action="store_true")
+parser.add_argument("--layernorm", action="store_true")
+parser.add_argument("--seed", type=int, default=0)
+args = parser.parse_args()
+
+# experiment-specific params
+
+# soft Q-network ensemble params
+N = args.n
+M = args.m
+UTD = args.utd
+ENABLE_SYNTHETIC = args.synthetic
+ENABLE_LAYERNORM = args.layernorm
+RUN_NAME = args.run_name
+
+# FIX PARAMS
+
+# environment
 DRONE_MODEL = DroneModel.CF2X
 ACT = ActionType.RPM
-PHYSICS = Physics.PYB # Physics.PYB_GND_DRAG_DW
+PHYSICS = Physics.PYB # Physics.PYB_GND_DRAG_DW ?
 SIMULATION_FREQ_HZ = 240
 CONTROL_FREQ_HZ = 48
 INIT_XYZ = np.array([0, 0, 1.0])
 
-# training params
-RUN_NAME = "latest_real_synth_20utd"
-NUM_TRAINING_ENVS = 1               # number of parallel game environments
-NUM_EVAL_ENVS = 6
-NUM_STEPS_TOTAL = 100_000           # number of training episodes
-WARMUP_LENGTH = 5000                # warmup period length (action sampling without training)
+# SAC training
+NUM_TRAINING_ENVS = 1   # number of parallel training environments
+NUM_EVAL_ENVS = 6   # number of parallel evaluation environments
+NUM_STEPS_TOTAL = 100_000   # number of training episodes
+WARMUP_LENGTH = 5000    # warmup period length (action sampling without training)
 REAL_BUFFER_SIZE = NUM_STEPS_TOTAL // NUM_TRAINING_ENVS
-SAC_BATCH_SIZE = 256                    # number of transitions to sample for an update
+SAC_BATCH_SIZE = 256    # number of transitions to sample for an update
 LOG_STD_MAX = 2
 LOG_STD_MIN = -5
-POLICY_LR = 3e-4                    # learning rate of the policy network optimizer
-Q_LR = 3e-4                         # learning rate of the Q network network optimizer
-GAMMA = 0.99                        # discount factor
-TAU = 5e-3
-AUTOTUNE = True                     # flag to toggle automatic tuning of the entropy regularization coefficient
-ALPHA = 0.2                         # entropy regularization coefficient
-UTD = 20                            # number of critic updates for each environment step
-POLICY_FREQ = 1                     # delayed policy update frequency
-TARGET_FREQ = 1                     # delayed target q network update frequency
-LOG_FREQ = 100
+POLICY_LR = 3e-4    # learning rate of the policy network optimizer
+Q_LR = 3e-4 # learning rate of the Q network network optimizer
+GAMMA = 0.99    # discount factor
+TAU = 5e-3  # target update coefficient
+AUTOTUNE = True # flag to toggle automatic tuning of the entropy regularization coefficient
+ALPHA = 0.2 # entropy regularization coefficient
+POLICY_FREQ = 1 # delayed policy update frequency in global steps
+TARGET_FREQ = 1 # delayed target q network update frequency in global steps
+LOG_FREQ = 100  # log to tensorboard frequency in global steps
 
-N = 2
-M = 2
+# synthetic sampling
+SYNTHETIC_RATIO = 0.5 if ENABLE_SYNTHETIC else 0 # ratio of synthetic samples and the full SAC_BATCH_SIZE 
+SYNTHETIC_DENOISING_STEPS = 128 # for noise schedule
+SYNTHETIC_SAMPLES = 200_000 # number of synthetic transitions to sample after each synther retrain 
+SYNTHETIC_SAMPLE_BATCH_SIZE = 100_000  # break SYNTHETIC_SAMPLES into smaller chunks to prevent OOM
 
-ENABLE_SYNTHETIC = True
-SYNTHETIC_RATIO = 0.5 if ENABLE_SYNTHETIC else 0
-SYNTHETIC_STARTS = 10_000
-SYNTHETIC_FREQ = 10_000
-
+# SynthER training
+SYNTHER_STARTS = 10_000
+SYNTHER_FREQ = 10_000
 SYNTHER_TRAIN_STEPS = 100_000
 SYNTHER_LR = 3e-4
 SYNTHER_TRAIN_BATCH_SIZE = 256
@@ -57,9 +79,6 @@ SYNTHER_EMA_FREQ = 10
 SYNTHER_EMA_AFTER = 100
 SYNTHER_EMA_BETA = 0.995
 SYNTHER_EMA_POWER = 2.0/3.0
-SYNTHER_SAMPLE_STEPS = 128
-NUM_SYNTHETIC_SAMPLES = 200_000
-SYNTHER_SAMPLE_BATCH_SIZE = 100_000
 
 
 class Actor(torch.nn.Module):
@@ -106,10 +125,10 @@ class SoftQNetwork(torch.nn.Module):
         super().__init__()
         self.net = torch.nn.Sequential(
             torch.nn.Linear(np.prod(obs_space.shape) + np.prod(act_space.shape), 256),
-            #torch.nn.LayerNorm(256),
+            torch.nn.LayerNorm(256) if ENABLE_LAYERNORM else torch.nn.Identity(),
             torch.nn.ReLU(),
             torch.nn.Linear(256, 256),
-            #torch.nn.LayerNorm(256),
+            torch.nn.LayerNorm(256) if ENABLE_LAYERNORM else torch.nn.Identity(),
             torch.nn.ReLU(),
             torch.nn.Linear(256, 1)
         )
@@ -122,8 +141,8 @@ class SoftQNetwork(torch.nn.Module):
 
 
 def make_env():
-    return TrajectoryAviary(
-        trajectory_generator=StaticTrajectory(xyz=INIT_XYZ, randomize=False),
+    return TargetAviary(
+        trajectory_generator=StaticTargetStateGenerator(xyz=INIT_XYZ, randomize=False),
         init_state_generator=DroneStateGenerator(init_xyz=INIT_XYZ, randomize=True),
         max_t=10,
         act=ACT,
@@ -173,11 +192,12 @@ if __name__ == "__main__":
     else:
         alpha = ALPHA
 
-    model_dir = f"models/sac/no_layernorm/{RUN_NAME}/"
+    subdir  = "layernorm" if ENABLE_LAYERNORM else "no_layernorm"
+    model_dir = f"models/sac/{subdir}/{RUN_NAME}/"
     if not os.path.exists(model_dir):
         os.mkdir(model_dir)
     model_path = os.path.join(model_dir, f"{RUN_NAME}.cleanrl_model")
-    runs_dir = f"runs/sac/no_layernorm/{RUN_NAME}/"
+    runs_dir = f"runs/sac/{subdir}/{RUN_NAME}/"
     if not os.path.exists(runs_dir):
         os.mkdir(runs_dir)
     writer = SummaryWriter(runs_dir)
@@ -223,11 +243,11 @@ if __name__ == "__main__":
         # 2) Updates
         if global_step >= WARMUP_LENGTH:
             # 2.1) SynthER update
-            if ENABLE_SYNTHETIC and global_step >= SYNTHETIC_STARTS and global_step % SYNTHETIC_FREQ == 0:
+            if ENABLE_SYNTHETIC and global_step >= SYNTHER_STARTS and global_step % SYNTHER_FREQ == 0:
 
                 if synthetic_buffer is None:
                     synthetic_buffer = RolloutBuffer(
-                        max_steps = NUM_SYNTHETIC_SAMPLES,
+                        max_steps = SYNTHETIC_SAMPLES,
                         n_envs = 1,
                         obs_shape = train_envs.single_observation_space.shape,
                         act_shape = train_envs.single_action_space.shape,
@@ -249,9 +269,9 @@ if __name__ == "__main__":
 
                 synthetic_sample = zip(
                     *generator.sample(
-                        num_samples=NUM_SYNTHETIC_SAMPLES,
-                        num_sample_steps=SYNTHER_SAMPLE_STEPS,
-                        sample_batch_size=SYNTHER_SAMPLE_BATCH_SIZE,
+                        num_samples=SYNTHETIC_SAMPLES,
+                        num_sample_steps=SYNTHETIC_DENOISING_STEPS,
+                        sample_batch_size=SYNTHETIC_SAMPLE_BATCH_SIZE,
                     )
                 )
 

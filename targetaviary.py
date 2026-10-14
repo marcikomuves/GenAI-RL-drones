@@ -5,13 +5,13 @@ from gymnasium import spaces
 import numpy as np
 import sys
 from collections import deque
-from trajectorygenerator import TrajectoryGenerator
+from targetstategenerator import TargetStateGenerator
 from dronestategenerator import DroneStateGenerator
 
-class TrajectoryAviary(BaseAviary):
+class TargetAviary(BaseAviary):
     def __init__(
         self,
-        trajectory_generator: TrajectoryGenerator,
+        target_state_generator: TargetStateGenerator,
         init_state_generator: DroneStateGenerator,
         max_t = None,
         max_dist = 3.0,
@@ -30,7 +30,7 @@ class TrajectoryAviary(BaseAviary):
             sys.exit(1)
 
         self.ACT_TYPE = act
-        self.traj_gen = trajectory_generator
+        self.target_state_generator = target_state_generator
         self.init_state_gen = init_state_generator
         self.lookahead_dt = 1.0/ctrl_freq
         self.t = 0
@@ -96,7 +96,7 @@ class TrajectoryAviary(BaseAviary):
         R = np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3)
         vel = state[10:13]
         ang_vel = state[13:16]
-        p_ref, v_ref = self.traj_gen.get(self.t)
+        p_ref, v_ref = self.target_state_generator.get(self.t)
         e_p_world = p_ref - pos
         e_p_body = R.T @ e_p_world
         e_v_world = v_ref - vel
@@ -126,7 +126,7 @@ class TrajectoryAviary(BaseAviary):
         vel = state[10:13]
         ang_vel = state[13:16]
         R = np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3) # columns of R = body-frame unit axes expressed in world coordinates
-        p_ref, v_ref = self.traj_gen.get(self.t)
+        p_ref, v_ref = self.target_state_generator.get(self.t)
         e_p_world = p_ref - pos
         dist = np.linalg.norm(e_p_world)
         e_v_world = v_ref - vel
@@ -163,7 +163,7 @@ class TrajectoryAviary(BaseAviary):
         rpy = state[7:10]
         vel = state[10:13]
         ang_vel = state[13:16]
-        p_ref, _ = self.traj_gen.get(self.t)
+        p_ref, _ = self.target_state_generator.get(self.t)
 
         # Too far from target
         if np.linalg.norm(pos - p_ref) > self.DIST_LIMIT_M:
@@ -215,7 +215,10 @@ class TrajectoryAviary(BaseAviary):
 
     def reset(self, seed=None, options=None):
         _, info = super().reset(seed=seed, options=options)
-        xyz, vel, rpy, ang_vel = self.init_state_gen.sample_initial_conditions()
+        self.init_state_gen.reset(self.np_random)
+        self.target_state_generator.reset(self.np_random)
+        self.t = 0
+        xyz, vel, rpy, ang_vel = self.init_state_gen.get()
         drone_id = self.getDroneIds()[0]
         p.resetBasePositionAndOrientation(
             drone_id, 
@@ -228,9 +231,7 @@ class TrajectoryAviary(BaseAviary):
             linearVelocity=vel.tolist(),
             angularVelocity=ang_vel.tolist(),
             physicsClientId=self.getPyBulletClient()
-        )
-        self.t = 0
-        self.traj_gen.reset()
+        )        
         self.action_buffer = deque([np.zeros(4) for _ in range(3)], maxlen=3)
         if hasattr(self, "prev_dist"):
             del self.prev_dist
