@@ -14,6 +14,8 @@ from rolloutbuffer import RolloutBuffer
 from synther import SimpleDiffusionGenerator
 import argparse
 
+# EXPERIMENT-SPECIFIC PARAMS
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--run-name", required=True)
 parser.add_argument("--n", type=int, default=2)
@@ -24,9 +26,6 @@ parser.add_argument("--layernorm", action="store_true")
 parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
 
-# experiment-specific params
-
-# soft Q-network ensemble params
 N = args.n
 M = args.m
 UTD = args.utd
