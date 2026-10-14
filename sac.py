@@ -195,11 +195,11 @@ if __name__ == "__main__":
     subdir  = "layernorm" if ENABLE_LAYERNORM else "no_layernorm"
     model_dir = f"models/sac/{subdir}/{RUN_NAME}/"
     if not os.path.exists(model_dir):
-        os.mkdir(model_dir)
+        os.makedirs(model_dir, exist_ok=True)
     model_path = os.path.join(model_dir, f"{RUN_NAME}.cleanrl_model")
     runs_dir = f"runs/sac/{subdir}/{RUN_NAME}/"
     if not os.path.exists(runs_dir):
-        os.mkdir(runs_dir)
+        os.makedirs(runs_dir, exist_ok=True)
     writer = SummaryWriter(runs_dir)
 
     print(f"[INFO] {bcolors.OKGREEN} Starting training...{bcolors.ENDC}")
