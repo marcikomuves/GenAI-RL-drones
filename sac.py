@@ -24,10 +24,11 @@ INIT_XYZ = np.array([0, 0, 1.0])
 # training params
 RUN_NAME = "latest_real_synth_20utd"
 NUM_TRAINING_ENVS = 1               # number of parallel game environments
+NUM_EVAL_ENVS = 6
 NUM_STEPS_TOTAL = 100_000           # number of training episodes
 WARMUP_LENGTH = 5000                # warmup period length (action sampling without training)
 REAL_BUFFER_SIZE = NUM_STEPS_TOTAL // NUM_TRAINING_ENVS
-BATCH_SIZE = 256                    # number of transitions to sample for an update
+SAC_BATCH_SIZE = 256                    # number of transitions to sample for an update
 LOG_STD_MAX = 2
 LOG_STD_MIN = -5
 POLICY_LR = 3e-4                    # learning rate of the policy network optimizer
@@ -36,7 +37,7 @@ GAMMA = 0.99                        # discount factor
 TAU = 5e-3
 AUTOTUNE = True                     # flag to toggle automatic tuning of the entropy regularization coefficient
 ALPHA = 0.2                         # entropy regularization coefficient
-UTD = 20                             # number of critic updates for each environment step
+UTD = 20                            # number of critic updates for each environment step
 POLICY_FREQ = 1                     # delayed policy update frequency
 TARGET_FREQ = 1                     # delayed target q network update frequency
 LOG_FREQ = 100
@@ -45,10 +46,20 @@ N = 2
 M = 2
 
 ENABLE_SYNTHETIC = True
+SYNTHETIC_RATIO = 0.5 if ENABLE_SYNTHETIC else 0
 SYNTHETIC_STARTS = 10_000
 SYNTHETIC_FREQ = 10_000
+
+SYNTHER_TRAIN_STEPS = 100_000
+SYNTHER_LR = 3e-4
+SYNTHER_TRAIN_BATCH_SIZE = 256
+SYNTHER_EMA_FREQ = 10
+SYNTHER_EMA_AFTER = 100
+SYNTHER_EMA_BETA = 0.995
+SYNTHER_EMA_POWER = 2.0/3.0
+SYNTHER_SAMPLE_STEPS = 128
 NUM_SYNTHETIC_SAMPLES = 200_000
-SYNTHETIC_RATIO = 0.5 if ENABLE_SYNTHETIC else 0
+SYNTHER_SAMPLE_BATCH_SIZE = 100_000
 
 
 class Actor(torch.nn.Module):
@@ -95,10 +106,10 @@ class SoftQNetwork(torch.nn.Module):
         super().__init__()
         self.net = torch.nn.Sequential(
             torch.nn.Linear(np.prod(obs_space.shape) + np.prod(act_space.shape), 256),
-            torch.nn.LayerNorm(256),
+            #torch.nn.LayerNorm(256),
             torch.nn.ReLU(),
             torch.nn.Linear(256, 256),
-            torch.nn.LayerNorm(256),
+            #torch.nn.LayerNorm(256),
             torch.nn.ReLU(),
             torch.nn.Linear(256, 1)
         )
@@ -131,8 +142,11 @@ if __name__ == "__main__":
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
     )
 
-    print(f"[INFO] {bcolors.OKGREEN} Initializing evalutaion environment...{bcolors.ENDC}")
-    eval_env = make_env()
+    print(f"[INFO] {bcolors.OKGREEN} Initializing evalutaion vectorized environments...{bcolors.ENDC}")
+    eval_envs = gym.vector.SyncVectorEnv(
+        [make_env for _ in range(NUM_EVAL_ENVS)],
+        autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
+    )
 
     print(f"[INFO] {bcolors.OKGREEN} Initializing device...{bcolors.ENDC}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -159,11 +173,11 @@ if __name__ == "__main__":
     else:
         alpha = ALPHA
 
-    model_dir = f"models/sac/{RUN_NAME}/"
+    model_dir = f"models/sac/no_layernorm/{RUN_NAME}/"
     if not os.path.exists(model_dir):
         os.mkdir(model_dir)
     model_path = os.path.join(model_dir, f"{RUN_NAME}.cleanrl_model")
-    runs_dir = f"runs/sac/{RUN_NAME}/"
+    runs_dir = f"runs/sac/no_layernorm/{RUN_NAME}/"
     if not os.path.exists(runs_dir):
         os.mkdir(runs_dir)
     writer = SummaryWriter(runs_dir)
@@ -184,7 +198,6 @@ if __name__ == "__main__":
             obs_space = train_envs.single_observation_space,
             act_space = train_envs.single_action_space,
             device=device,
-            normalizer_type="standard",
             terminal_threshold=0.5,
         )
 
@@ -192,7 +205,6 @@ if __name__ == "__main__":
     pbar = tqdm(range(NUM_STEPS_TOTAL), desc="[SAC] Global step", mininterval=1, leave=False)
     for global_step in pbar:
         actor.train()
-
         # 1) Rollout episode (1 step at a time)
         if global_step >= WARMUP_LENGTH:
             with torch.no_grad():
@@ -200,7 +212,6 @@ if __name__ == "__main__":
                 actions = actions.cpu().numpy()
         else:
             actions = np.array([train_envs.single_action_space.sample() for _ in range(NUM_TRAINING_ENVS)])
-
         next_obs, rewards, terminations, truncations, infos = train_envs.step(actions)
         true_next_obs = next_obs.copy()
         for idx, done in enumerate(np.logical_or(terminations, truncations)):
@@ -209,15 +220,12 @@ if __name__ == "__main__":
         real_buffer.append(obs, actions, rewards, terminations, truncations, true_next_obs)
         obs = next_obs
 
-
         # 2) Updates
         if global_step >= WARMUP_LENGTH:
-
             # 2.1) SynthER update
             if ENABLE_SYNTHETIC and global_step >= SYNTHETIC_STARTS and global_step % SYNTHETIC_FREQ == 0:
 
                 if synthetic_buffer is None:
-
                     synthetic_buffer = RolloutBuffer(
                         max_steps = NUM_SYNTHETIC_SAMPLES,
                         n_envs = 1,
@@ -225,27 +233,25 @@ if __name__ == "__main__":
                         act_shape = train_envs.single_action_space.shape,
                         device = device,
                     )
-
                 else:
-
                     synthetic_buffer.reset()
 
                 generator.retrain(
                     real_buffer=real_buffer,
-                    train_steps=100_000,
-                    batch_size=256,
-                    lr=3e-4,
-                    ema_freq=10,
-                    ema_after=100,
-                    beta=0.995,
-                    power=2.0/3.0
+                    train_steps=SYNTHER_TRAIN_STEPS,
+                    batch_size=SYNTHER_TRAIN_BATCH_SIZE,
+                    lr=SYNTHER_LR,
+                    ema_freq=SYNTHER_EMA_FREQ,
+                    ema_after=SYNTHER_EMA_AFTER,
+                    beta=SYNTHER_EMA_BETA,
+                    power=SYNTHER_EMA_POWER
                 )
 
                 synthetic_sample = zip(
                     *generator.sample(
                         num_samples=NUM_SYNTHETIC_SAMPLES,
-                        num_sample_steps=128,
-                        sample_batch_size=100_000,
+                        num_sample_steps=SYNTHER_SAMPLE_STEPS,
+                        sample_batch_size=SYNTHER_SAMPLE_BATCH_SIZE,
                     )
                 )
 
@@ -256,11 +262,11 @@ if __name__ == "__main__":
             for epoch in range(UTD):
                 
                 if ENABLE_SYNTHETIC and synthetic_buffer is not None:
-                    real = real_buffer.sample(int(BATCH_SIZE * (1.0 - SYNTHETIC_RATIO)))
-                    synthetic = synthetic_buffer.sample(int(BATCH_SIZE * SYNTHETIC_RATIO))
+                    real = real_buffer.sample(int(SAC_BATCH_SIZE * (1.0 - SYNTHETIC_RATIO)))
+                    synthetic = synthetic_buffer.sample(int(SAC_BATCH_SIZE * SYNTHETIC_RATIO))
                     data = {k: torch.cat([real[k], synthetic[k]], dim=0) for k in real}
                 else:
-                    data = real_buffer.sample(BATCH_SIZE)
+                    data = real_buffer.sample(SAC_BATCH_SIZE)
 
                 with torch.no_grad():
                     next_state_actions, next_state_log_pi, _ = actor.get_action(data["next_obs"])
@@ -278,11 +284,11 @@ if __name__ == "__main__":
             if global_step % POLICY_FREQ == 0:
 
                 if ENABLE_SYNTHETIC and synthetic_buffer is not None:
-                    real = real_buffer.sample(int(BATCH_SIZE * (1.0 - SYNTHETIC_RATIO)))
-                    synthetic = synthetic_buffer.sample(int(BATCH_SIZE * SYNTHETIC_RATIO))
+                    real = real_buffer.sample(int(SAC_BATCH_SIZE * (1.0 - SYNTHETIC_RATIO)))
+                    synthetic = synthetic_buffer.sample(int(SAC_BATCH_SIZE * SYNTHETIC_RATIO))
                     data = {k: torch.cat([real[k], synthetic[k]], dim=0) for k in real}
                 else:
-                    data = real_buffer.sample(BATCH_SIZE)
+                    data = real_buffer.sample(SAC_BATCH_SIZE)
 
                 for _ in range(POLICY_FREQ): # Compensate for the delay by doing POLICY_FREQ instead of 1
                     pi, log_pi, _ = actor.get_action(data["obs"])
@@ -323,19 +329,27 @@ if __name__ == "__main__":
                 # 3.2) Eval episode stats
                 if global_step % (LOG_FREQ * 10) == 0:
                     actor.eval()
-                    eval_obs, _ = eval_env.reset(seed=0)
-                    eval_done, eval_ep_rewards, eval_ep_length = False, 0.0, 0
-                    while not eval_done:
-                        with torch.no_grad():
-                            _, _, action_mean = actor.get_action(x=torch.as_tensor(eval_obs, dtype=torch.float32, device=device).unsqueeze(0))
-                        eval_obs, reward, terminated, truncated, _ = eval_env.step(action_mean[0].cpu().numpy())
-                        eval_ep_rewards += reward
-                        eval_ep_length += 1
-                        eval_done = terminated or truncated
-                    stats["eval/eval_ep_reward"] = eval_ep_rewards
-                    stats["eval/eval_ep_length"] = eval_ep_length
+                    eval_obs, _ = eval_envs.reset(seed=list(range(NUM_EVAL_ENVS)))   # one seed per env
 
-                    pbar.set_postfix(eval_ep_reward = f"{eval_ep_rewards:.4f}",)
+                    alive = np.ones(NUM_EVAL_ENVS, dtype=bool)
+                    ep_rewards = np.zeros(NUM_EVAL_ENVS, dtype=np.float64)
+                    ep_lengths = np.zeros(NUM_EVAL_ENVS, dtype=np.int64)
+
+                    while alive.any():
+                        with torch.no_grad():
+                            obs_t = torch.as_tensor(eval_obs, dtype=torch.float32, device=device)
+                            _, _, action_mean = actor.get_action(x=obs_t)      # already batched, no unsqueeze
+                        eval_obs, reward, terminated, truncated, _ = eval_envs.step(action_mean.cpu().numpy())
+
+                        ep_rewards += reward * alive          # only count envs that were still alive
+                        ep_lengths += alive                   # the step that ends the episode still counts
+                        alive &= ~(terminated | truncated)    # update AFTER accumulating
+
+                    actor.train()
+                    stats["eval/eval_ep_reward"] = ep_rewards.mean()
+                    stats["eval/eval_ep_length"] = ep_lengths.mean()
+
+                    pbar.set_postfix(eval_ep_reward = f"{ep_rewards.mean():.4f}",)
 
                     torch.save(actor.state_dict(), model_path)
 

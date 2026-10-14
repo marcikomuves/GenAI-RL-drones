@@ -327,14 +327,12 @@ class SimpleDiffusionGenerator:
         obs_space,
         act_space,
         device,
-        normalizer_type,
         terminal_threshold,
     ):
         self.obs_dim = obs_space.shape[0]
         self.act_dim = act_space.shape[0]
         self.dim = 2 * self.obs_dim + self.act_dim + 2
         self.device = device
-        self.normalizer_type = normalizer_type
         self.terminal_threshold = terminal_threshold
         self.model = None  # EMA model, set by retrain()
         self.ema_model = None
