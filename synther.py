@@ -1,4 +1,3 @@
-# synther_generator.py
 import copy
 import numpy as np
 import torch
@@ -226,6 +225,9 @@ class ElucidatedDiffusion(torch.nn.Module):
         sigmas = torch.nn.functional.pad(sigmas, (0, 1), value=0.)  # last step is sigma value of 0.
         return sigmas
 
+    def noise_distribution(self, batch_size):
+        return (self.P_mean + self.P_std * torch.randn((batch_size,), device=self.device)).exp()
+
 
     # preconditioned network output, equation (7) in the paper
     def preconditioned_forward(
@@ -249,6 +251,17 @@ class ElucidatedDiffusion(torch.nn.Module):
             out = out.clamp(-1., 1.)
         return out
 
+    def denoise_over_sigma(
+        self,
+        x, 
+        sigma, 
+        clamp: bool = False, 
+        cond=None,
+    ):
+        denoised = self.preconditioned_forward(x, sigma, clamp=clamp, cond=cond)
+        denoised_over_sigma = (x - denoised) / sigma
+        return denoised_over_sigma
+
 
     def forward(
         self, 
@@ -258,7 +271,7 @@ class ElucidatedDiffusion(torch.nn.Module):
         inputs = self.normalizer.normalize(inputs)
         batch_size, *event_shape = inputs.shape
         assert event_shape == self.event_shape, f'mismatch of event shape, expected {self.event_shape}, got {event_shape}'
-        sigmas = (self.P_mean + self.P_std * torch.randn((batch_size,), device=self.device)).exp() # noise distribution
+        sigmas = self.noise_distribution(batch_size)
         padded_sigmas = sigmas.view(batch_size, *([1] * len(self.event_shape)))
         noise = torch.randn_like(inputs)
         noised_inputs = inputs + padded_sigmas * noise  # alphas are 1. in the paper
@@ -277,47 +290,49 @@ class ElucidatedDiffusion(torch.nn.Module):
         num_sample_steps: Optional[int] = None,
         clamp: bool = True,
         cond=None,
-        disable_tqdm: bool = False,
+        trace = False
     ):
+               
         num_sample_steps = num_sample_steps if num_sample_steps is not None else self.num_sample_steps
         shape = (batch_size, *self.event_shape)
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
         sigmas = self.sample_schedule(num_sample_steps)
         gammas = torch.where((sigmas >= self.S_tmin) & (sigmas <= self.S_tmax), min(self.S_churn / num_sample_steps, np.sqrt(2) - 1), 0.)
-        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
 
         # sample from noise
-        init_sigma = sigmas[0]
-        inputs = init_sigma * torch.randn(shape, device=self.device)
+        x = sigmas[0] * torch.randn(shape, device=self.device)
 
         # denoise
-        for sigma, sigma_next, gamma in tqdm(sigmas_and_gammas, desc='[SynthER] Sampling time step', mininterval=1, disable=disable_tqdm):
-            sigma, sigma_next, gamma = map(lambda t: t.item(), (sigma, sigma_next, gamma))
-            eps = self.S_noise * torch.randn(shape, device=self.device)
-            sigma_hat = sigma + gamma * sigma
-            inputs_hat = inputs + np.sqrt(sigma_hat ** 2 - sigma ** 2) * eps
-            denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
-            inputs_next = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma
-            # second order correction, if not the last timestep
-            if sigma_next != 0:
-                denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=cond)
-                inputs_next = inputs_hat + 0.5 * (sigma_next - sigma_hat) * (denoised_over_sigma + denoised_prime_over_sigma)
-            inputs = inputs_next
-        if clamp:
-            inputs = inputs.clamp(-1., 1.)
-        return self.normalizer.unnormalize(inputs)
+        if trace:
+            trace_chunk = []
+            idxs = torch.randperm(batch_size, device=x.device)[:max(1, 512)]
+        else:
+            trace_chunk = None
 
-    # This is known as 'denoised_over_sigma' in the lucidrains repo.
-    def score_fn(
-        self,
-        x, 
-        sigma, 
-        clamp: bool = False, 
-        cond=None,
-    ):
-        denoised = self.preconditioned_forward(x, sigma, clamp=clamp, cond=cond)
-        denoised_over_sigma = (x - denoised) / sigma
-        return denoised_over_sigma
+        pbar = tqdm(enumerate(zip(sigmas[:-1], sigmas[1:], gammas[:-1])), desc='[SynthER] Sampling time step', mininterval=1, leave=False)
+        for step, (s, s_next, g) in pbar:
+            s, s_next, g = s.item(), s_next.item(), g.item()
+            eps = self.S_noise * torch.randn_like(x)
+            s_hat = s + g * s
+            x_hat = x + np.sqrt(s_hat**2 - s**2) * eps
+            denoised_over_sigma = self.denoise_over_sigma(x_hat, s_hat, clamp=clamp, cond=cond)
+            x_next = x_hat + (s_next - s_hat) * denoised_over_sigma
+            if s_next != 0:
+                denoised_prime_over_sigma = self.denoise_over_sigma(x_next, s_next, clamp=clamp, cond=cond)
+                x_next = x_hat + 0.5 * (s_next - s_hat) * (denoised_over_sigma + denoised_prime_over_sigma)
+            x = x_next
+
+            # At 512 pre-selected indexes from the evolving batch log on every 8th denoising step: 
+            #   - sigma 
+            #   - the actual value of the sample through the denoising process 
+            #   - the denoiser's current clean estimate
+            if (step % 8 == 0 or step == num_sample_steps - 1) and trace:
+                x0_hat = x_hat - s_hat * denoised_over_sigma
+                trace_chunk.append(((s, x[idxs].cpu(), x0_hat[idxs].cpu()), step))
+
+        if clamp:
+            x = x.clamp(-1., 1.)
+        return self.normalizer.unnormalize(x), trace_chunk
 
 
 class SimpleDiffusionGenerator:
@@ -358,8 +373,16 @@ class SimpleDiffusionGenerator:
         beta,
         power,
         lr,
+        trace = False,
     ):
-        # 1) build a fresh model (what construct_diffusion_model did, minus gin)
+        if trace:
+            trace_batch = self._pack(real_buffer.sample(batch_size)).to(self.device)
+            losses = []
+            losses_binned = []
+        else:
+            losses = None
+            losses_binned = None
+        
         model = ElucidatedDiffusion(
             denoiser_net = ResidualMLPDenoiser(
                 d_in=self.dim, 
@@ -403,8 +426,50 @@ class SimpleDiffusionGenerator:
                             be.copy_(b)
             if step % 1000 == 0:
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+                if trace:
+                    # Loss at current training step:
+                    # 
+                    # The MSE between the model's output (result of the learned denoising) and the normalized target (batch of real samples)
+                    losses.append((loss.item(), step))
+
+                    # Loss binned by sigma at current training step on a fix batch: 
+                    # 
+                    # 1) Each sample in the batch gets its own sigma from the training distribution.
+                    # 2) The sample is noised with its own sigma.
+                    # 3) The model tries to denoise it knowing the sigma value.
+                    # 4) Loss: the MSE of the denoised and the original sample batch 
+                    # 5) Take the mean of these losses grouped by the sigma bin their sigma belongs to (5 groups of about 20% of the samples each):
+                    #   @ 0: 
+                    #       - tiny to 0.11: almost clean input  
+                    #       - Shows shows how precisely the model reproduces a nearly clean sample. This is the regime that sets transition precision.
+                    #   @ 1-3:  
+                    #       - 0.11 to 0.22: low noise  
+                    #       - 0.22 to 0.41: moderate
+                    #       - 0.41 to 0.83: substantial noise
+                    #       - Model quality shows up. A value that drops during training is real learning.
+                    #   @ 4:  
+                    #       - 0.83 to the largest drawn value (often 5 to 30+): heavy noise
+                    #       - should plateau near 1, the per-dimension data variance in normalized space. With heavy noise, the best possible guess is close to the data mean
+                    # 
+                    # Expected to see decreasing values throughout training (mostly 1-3).
+                    with torch.no_grad():
+                        sig = model.noise_distribution(len(trace_batch))
+                        x = model.normalizer.normalize(trace_batch)
+                        noised = x + sig[:, None] * torch.randn_like(x)
+                        den = model.preconditioned_forward(noised, sig)
+                        per = ((den - x) ** 2).mean(1)
+                        edges = torch.quantile(sig, torch.linspace(0, 1, 6, device=sig.device))
+                        bins_at_step = []
+                        for k in range(5):
+                            m = (sig >= edges[k]) & (sig <= edges[k + 1])
+                            bins_at_step.append(per[m].mean().item())
+                        losses_binned.append((bins_at_step, step))
+
         self.model = self.ema_model.eval()
         self.actual_model = self.model
+
+        return losses, losses_binned
 
     
     def warm_retrain(
@@ -461,30 +526,41 @@ class SimpleDiffusionGenerator:
         self, 
         num_samples, 
         num_sample_steps, 
-        sample_batch_size
+        sample_batch_size,
+        trace = False,
     ):
         assert self.actual_model is not None, "call retrain() first"
 
-        # sampling in chunks to prevent OOM errors 
-        chunks = []
+        sample_chunks = []
+        trace_chunks = []
         for start in range(0, num_samples, sample_batch_size):
             n = min(sample_batch_size, num_samples - start)
-            chunks.append(
-                self.actual_model.sample(
-                    batch_size=n, 
-                    num_sample_steps=num_sample_steps, 
-                    clamp=False
-                ).cpu().numpy()
+            sample_chunk, trace_chunk = self.actual_model.sample(
+                batch_size=n, 
+                num_sample_steps=num_sample_steps, 
+                clamp=False,
+                trace=trace
             )
-        s = np.concatenate(chunks, axis=0)
+            sample_chunks.append(sample_chunk.cpu().numpy())
+            trace_chunks.append(trace_chunk)
+        s = np.concatenate(sample_chunks, axis=0)
+        if trace:
+            trace_chunks_concat = []
+            for steps in zip(*trace_chunks): # steps = this step's entry from every chunk
+                (sigma, _, _), step_idx = steps[0]                 # same across chunks
+                x  = torch.cat([st[0][1] for st in steps], dim=0)
+                x0 = torch.cat([st[0][2] for st in steps], dim=0)
+                trace_chunks_concat.append((step_idx, sigma, x, x0))
+        else:
+            trace_chunks_concat = None
 
         o, a = self.obs_dim, self.act_dim
         obs = s[:, :o]
         act = s[:, o:o + a]
         rew = s[:, o + a]
-        delta = s[:, o + a + 1:o + a + 13]
+        delta = s[:, o+a+1:2*o+a+1]
         term = s[:, -1]
         next_obs = obs + delta
         if self.terminal_threshold is not None:
             term = (term > self.terminal_threshold).astype(np.float32)
-        return obs, act, rew, next_obs, term
+        return obs, act, rew, next_obs, term, trace_chunks_concat

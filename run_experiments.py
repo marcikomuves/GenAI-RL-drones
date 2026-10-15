@@ -1,6 +1,6 @@
 import subprocess, sys
 
-SCRIPT = "sac.py"
+SCRIPT = "sac_experiment.py"
 
 EXPERIMENTS = {
     "sac_noln_utd1":            "--n 2  --m 2 --utd 1",
