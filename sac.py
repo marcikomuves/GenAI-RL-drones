@@ -1,7 +1,6 @@
 import os
 import numpy as np
 from tqdm import tqdm
-from color import bcolors
 import torch
 import itertools
 from torch.utils.tensorboard import SummaryWriter
@@ -154,23 +153,18 @@ def make_env():
 
 if __name__ == "__main__":
 
-    print(f"[INFO] {bcolors.OKGREEN} Initializing training vectorized environments...{bcolors.ENDC}")
     train_envs = gym.vector.SyncVectorEnv(
         [make_env for _ in range(NUM_TRAINING_ENVS)],
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
     )
 
-    print(f"[INFO] {bcolors.OKGREEN} Initializing evalutaion vectorized environments...{bcolors.ENDC}")
     eval_envs = gym.vector.SyncVectorEnv(
         [make_env for _ in range(NUM_EVAL_ENVS)],
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
     )
 
-    print(f"[INFO] {bcolors.OKGREEN} Initializing device...{bcolors.ENDC}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] {device}")
-
-    print(f"[INFO] {bcolors.OKGREEN} Initializing agent...{bcolors.ENDC}")
 
     qfs = []
     qf_targets = []
@@ -180,7 +174,6 @@ if __name__ == "__main__":
         qf_target.load_state_dict(qf.state_dict())
         qfs.append(qf); qf_targets.append(qf_target)
     q_optimizer = torch.optim.Adam(itertools.chain.from_iterable(q.parameters() for q in qfs), lr=Q_LR)
-    
     actor = Actor(train_envs.single_action_space, train_envs.single_observation_space).to(device)
     actor_optimizer = torch.optim.Adam(list(actor.parameters()), lr=POLICY_LR)
     if AUTOTUNE:
@@ -191,17 +184,15 @@ if __name__ == "__main__":
     else:
         alpha = ALPHA
 
-    subdir  = "layernorm" if ENABLE_LAYERNORM else "no_layernorm"
-    model_dir = f"models/sac/{subdir}/{RUN_NAME}/"
+    model_dir = f"models/sac/{RUN_NAME}/"
     if not os.path.exists(model_dir):
         os.makedirs(model_dir, exist_ok=True)
     model_path = os.path.join(model_dir, f"{RUN_NAME}.cleanrl_model")
-    runs_dir = f"runs/sac/{subdir}/{RUN_NAME}/"
+
+    runs_dir = f"runs/sac/{RUN_NAME}/"
     if not os.path.exists(runs_dir):
         os.makedirs(runs_dir, exist_ok=True)
     writer = SummaryWriter(runs_dir)
-
-    print(f"[INFO] {bcolors.OKGREEN} Starting training...{bcolors.ENDC}")
 
     real_buffer = RolloutBuffer(
         max_steps = REAL_BUFFER_SIZE,
