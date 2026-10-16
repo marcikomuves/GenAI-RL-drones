@@ -1,6 +1,8 @@
+import os
 import copy
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from typing import List, Optional, Sequence
 
@@ -324,11 +326,18 @@ class ElucidatedDiffusion(torch.nn.Module):
 
             # At 512 pre-selected indexes from the evolving batch log on every 8th denoising step: 
             #   - sigma 
-            #   - the actual value of the sample through the denoising process 
+            #   - the noisy iterate 
             #   - the denoiser's current clean estimate
             if (step % 8 == 0 or step == num_sample_steps - 1) and trace:
                 x0_hat = x_hat - s_hat * denoised_over_sigma
-                trace_chunk.append(((s, x[idxs].cpu(), x0_hat[idxs].cpu()), step))
+                trace_chunk.append((
+                    (
+                        s, 
+                        x[idxs].cpu(), 
+                        x0_hat[idxs].cpu()
+                    ), 
+                    step)
+                )
 
         if clamp:
             x = x.clamp(-1., 1.)
@@ -427,32 +436,8 @@ class SimpleDiffusionGenerator:
             if step % 1000 == 0:
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-                if trace:
-                    # Loss at current training step:
-                    # 
-                    # The MSE between the model's output (result of the learned denoising) and the normalized target (batch of real samples)
+                if trace:                   
                     losses.append((loss.item(), step))
-
-                    # Loss binned by sigma at current training step on a fix batch: 
-                    # 
-                    # 1) Each sample in the batch gets its own sigma from the training distribution.
-                    # 2) The sample is noised with its own sigma.
-                    # 3) The model tries to denoise it knowing the sigma value.
-                    # 4) Loss: the MSE of the denoised and the original sample batch 
-                    # 5) Take the mean of these losses grouped by the sigma bin their sigma belongs to (5 groups of about 20% of the samples each):
-                    #   @ 0: 
-                    #       - tiny to 0.11: almost clean input  
-                    #       - Shows shows how precisely the model reproduces a nearly clean sample. This is the regime that sets transition precision.
-                    #   @ 1-3:  
-                    #       - 0.11 to 0.22: low noise  
-                    #       - 0.22 to 0.41: moderate
-                    #       - 0.41 to 0.83: substantial noise
-                    #       - Model quality shows up. A value that drops during training is real learning.
-                    #   @ 4:  
-                    #       - 0.83 to the largest drawn value (often 5 to 30+): heavy noise
-                    #       - should plateau near 1, the per-dimension data variance in normalized space. With heavy noise, the best possible guess is close to the data mean
-                    # 
-                    # Expected to see decreasing values throughout training (mostly 1-3).
                     with torch.no_grad():
                         sig = model.noise_distribution(len(trace_batch))
                         x = model.normalizer.normalize(trace_batch)
@@ -564,3 +549,89 @@ class SimpleDiffusionGenerator:
         if self.terminal_threshold is not None:
             term = (term > self.terminal_threshold).astype(np.float32)
         return obs, act, rew, next_obs, term, trace_chunks_concat
+
+
+
+def diffusion_diagnostics(retrain_idx, losses, losses_binned, denoising_trace, real_buffer, generator):
+
+    def block_moments(real, synth, o, a, end):
+        real, synth = real[:, :end], synth[:, :end]
+        blocks = {
+            "obs": slice(0, o), 
+            "act": slice(o, o + a),
+            "rew": slice(o + a, o + a + 1), 
+            "delta": slice(o + a + 1, end)
+        }
+        out = {}
+        for k, s in blocks.items():
+            out[k] = dict(
+                synth_mean = (synth.mean(0)[s].mean(), synth.mean(0)[s].min(), synth.mean(0)[s].max()),
+                synth_std = (synth.std(0)[s].mean(), synth.std(0)[s].min(), synth.std(0)[s].max()),
+                real_mean = real.mean(0)[s].mean(), 
+                real_std = real.std(0)[s].mean()
+            )
+        return out
+
+    synther_runs_dir = f"runs/synther/retrain_{retrain_idx}/"
+    if not os.path.exists(synther_runs_dir):
+        os.makedirs(synther_runs_dir, exist_ok=True)
+    w = SummaryWriter(synther_runs_dir)
+
+    # Loss at each training step:
+    # The MSE between the model's output (result of the learned denoising) and the normalized target (batch of real samples)
+    for v, s in losses:
+        w.add_scalar("train/loss", v, s)
+
+    # Binned loss at each training step: 
+    # 1) Each sample in the batch gets its own sigma from the training distribution.
+    # 2) The sample is noised with its own sigma.
+    # 3) The model tries to denoise it knowing the sigma value.
+    # 4) Loss: the MSE of the denoised and the original sample batch 
+    # 5) Take the mean of these losses grouped by the sigma bin their sigma belongs to (5 groups of about 20% of the samples each):
+    #   @ 0: 
+    #       - tiny to 0.11: almost clean input  
+    #       - Shows shows how precisely the model reproduces a nearly clean sample. This is the regime that sets transition precision.
+    #   @ 1-3:  
+    #       - 0.11 to 0.22: low noise  
+    #       - 0.22 to 0.41: moderate
+    #       - 0.41 to 0.83: substantial noise
+    #       - Model quality shows up. A value that drops during training is real learning.
+    #   @ 4:  
+    #       - 0.83 to the largest drawn value (often 5 to 30+): heavy noise
+    #       - should plateau near 1, the per-dimension data variance in normalized space. With heavy noise, the best possible guess is close to the data mean
+    # 
+    # Expected to see decreasing values throughout training (mostly 1-3).
+    for bins, s in losses_binned:
+        for k, b in enumerate(bins):
+            w.add_scalar(f"train/mse_bin{k}", float(b), s)
+
+    with torch.no_grad():
+        packed = generator._pack(real_buffer.ordered())
+        sub = packed[torch.randperm(len(packed))[:20_000]].to(generator.device)
+        real_norm = generator.actual_model.normalizer.normalize(sub).cpu().numpy()
+
+    # Sampling process
+    o, a, end = generator.obs_dim, generator.act_dim, generator.dim - 1
+    for step, sigma, x, x0 in denoising_trace:
+        # sigma schedule from sampling trace (log-y)
+        w.add_scalar("sampling/sigma", sigma, step)
+
+        # plot how the sample's moments start to fit to the real dataset's moments over denoising steps
+        for k, d in block_moments(real_norm, x0.numpy(), o, a, end).items():
+            for stat in ("mean", "std"):
+                m, lo, hi, r = d[f"synth_{stat}"], d[f"real_{stat}"]
+                w.add_scalar(f"sampling/{k}_{stat}_mean", m,  step)
+                w.add_scalar(f"sampling/{k}_{stat}_min",  lo, step)
+                w.add_scalar(f"sampling/{k}_{stat}_max",  hi, step)
+                w.add_scalar(f"sampling/{k}_{stat}_real", r,  step)
+
+    w.close()
+
+    np.savez_compressed(
+        f"{synther_runs_dir}.npz",
+        real_norm=real_norm,                                    # (N, dim), normalized space
+        trace_steps=np.array([t[0] for t in denoising_trace]),
+        trace_sigmas=np.array([t[1] for t in denoising_trace]),
+        trace_x=np.stack([t[2].numpy() for t in denoising_trace]),    # noisy iterates
+        trace_x0=np.stack([t[3].numpy() for t in denoising_trace]),   # clean estimates
+    )

@@ -10,7 +10,7 @@ from targetaviary import TargetAviary
 from targetstategenerator import StaticTargetStateGenerator
 from dronestategenerator import DroneStateGenerator
 from rolloutbuffer import RolloutBuffer
-from synther import SimpleDiffusionGenerator
+from synther import SimpleDiffusionGenerator, diffusion_diagnostics
 from sac import Actor, SoftQNetwork
 import argparse
 
@@ -211,51 +211,8 @@ if __name__ == "__main__":
                     synthetic_buffer.append(obs_synth, act_synth, reward_synth, terminated_synth, False, next_obs_synth)
 
                 # log diffusion training stats
-                if losses is not None and losses_binned is not None and denoising_trace is not None:
-                    synther_runs_dir = f"runs/synther/retrain_{retrain_idx}/"
-                    if not os.path.exists(synther_runs_dir):
-                        os.makedirs(synther_runs_dir, exist_ok=True)
-                    w = SummaryWriter(synther_runs_dir)
-
-                    # training losses
-                    for v, s in losses:
-                        w.add_scalar("train/loss", v, s)
-
-                    # binned training losses
-                    for bins, s in losses_binned:
-                        for k, b in enumerate(bins):
-                            w.add_scalar(f"train/mse_bin{k}", float(b), s)
-                    w.add_custom_scalars({"SynthER": {"binned MSE": ["Multiline", [f"train/mse_bin{k}" for k in range(5)]]}})
-
-                    # sigma schedule from sampling traces (log-y)
-                    with torch.no_grad():
-                        sigmas_full = generator.actual_model.sample_schedule(SYNTHETIC_DENOISING_STEPS)[:-1].cpu().numpy()
-                    for i, sg in enumerate(sigmas_full):
-                        w.add_scalar("sampling/sigma", float(sg), i)
-
-                    # trace PCA-s
-                    with torch.no_grad():
-                        rows = real_buffer.ordered()
-                        packed = generator._pack(rows)
-                        sub = packed[torch.randperm(len(packed))[:20_000]].to(device)
-                        real_norm = generator.actual_model.normalizer.normalize(sub).cpu().numpy()
-                    n = min(5000, len(real_norm))
-                    real_t = torch.as_tensor(real_norm[:n])
-                    synth_t = denoising_trace[-1][3][:512]
-                    mat = torch.cat([real_t, synth_t])
-                    meta = ["real"] * len(real_t) + ["synthetic"] * len(synth_t)
-                    w.add_embedding(mat, metadata=meta, tag="real_vs_synth", global_step=retrain_idx)
-                    w.close()
-
-                    np.savez_compressed(
-                        f"{synther_runs_dir}.npz",
-                        real_norm=real_norm,                                    # (N, dim), normalized space
-                        trace_steps=np.array([t[0] for t in denoising_trace]),
-                        trace_sigmas=np.array([t[1] for t in denoising_trace]),
-                        trace_x=np.stack([t[2].numpy() for t in denoising_trace]),    # noisy iterates
-                        trace_x0=np.stack([t[3].numpy() for t in denoising_trace]),   # clean estimates
-                    )
-
+                if trace and (losses is not None and losses_binned is not None and denoising_trace is not None):
+                    diffusion_diagnostics(retrain_idx, losses, losses_binned, denoising_trace, real_buffer, generator)
                 retrain_idx += 1
                 
 
@@ -356,5 +313,3 @@ if __name__ == "__main__":
 
                 for key, value in stats.items():
                     writer.add_scalar(key, value, global_step/100)
-
-                    
