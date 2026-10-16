@@ -307,7 +307,7 @@ class ElucidatedDiffusion(torch.nn.Module):
         # denoise
         if trace:
             trace_chunk = []
-            idxs = torch.randperm(batch_size, device=x.device)[:max(1, 512)]
+            idxs = torch.randperm(batch_size, device=x.device)[:max(1, 1024)]
         else:
             trace_chunk = None
 
@@ -552,7 +552,7 @@ class SimpleDiffusionGenerator:
 
 
 
-def diffusion_diagnostics(retrain_idx, losses, losses_binned, denoising_trace, real_buffer, generator):
+def diffusion_diagnostics(run_name, retrain_idx, losses, losses_binned, denoising_trace, real_buffer, generator):
 
     def block_moments(real, synth, o, a, end):
         real, synth = real[:, :end], synth[:, :end]
@@ -572,7 +572,7 @@ def diffusion_diagnostics(retrain_idx, losses, losses_binned, denoising_trace, r
             )
         return out
 
-    synther_runs_dir = f"runs/synther/retrain_{retrain_idx}/"
+    synther_runs_dir = f"runs/synther/{run_name}/retrain_{retrain_idx}/"
     if not os.path.exists(synther_runs_dir):
         os.makedirs(synther_runs_dir, exist_ok=True)
     w = SummaryWriter(synther_runs_dir)
@@ -619,8 +619,9 @@ def diffusion_diagnostics(retrain_idx, losses, losses_binned, denoising_trace, r
         # plot how the sample's moments start to fit to the real dataset's moments over denoising steps
         for k, d in block_moments(real_norm, x0.numpy(), o, a, end).items():
             for stat in ("mean", "std"):
-                m, lo, hi, r = d[f"synth_{stat}"], d[f"real_{stat}"]
-                w.add_scalar(f"sampling/{k}_{stat}_mean", m,  step)
+                m, lo, hi = d[f"synth_{stat}"]
+                r = d[f"real_{stat}"]
+                w.add_scalar(f"sampling/{k}_{stat}",      m,  step)   # drops the confusing "_mean_mean"
                 w.add_scalar(f"sampling/{k}_{stat}_min",  lo, step)
                 w.add_scalar(f"sampling/{k}_{stat}_max",  hi, step)
                 w.add_scalar(f"sampling/{k}_{stat}_real", r,  step)
@@ -628,7 +629,7 @@ def diffusion_diagnostics(retrain_idx, losses, losses_binned, denoising_trace, r
     w.close()
 
     np.savez_compressed(
-        f"{synther_runs_dir}.npz",
+        f"{synther_runs_dir}diagnostics.npz",
         real_norm=real_norm,                                    # (N, dim), normalized space
         trace_steps=np.array([t[0] for t in denoising_trace]),
         trace_sigmas=np.array([t[1] for t in denoising_trace]),

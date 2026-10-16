@@ -143,7 +143,7 @@ if __name__ == "__main__":
     if ENABLE_SYNTHETIC:
         synthetic_buffer = None
         retrain_idx = 0
-        trace_retrain_idxs = [0, 2, 5, 9]
+        trace_retrain_idxs = [0, 2, 5, 8]
         generator = SimpleDiffusionGenerator(
             obs_space = train_envs.single_observation_space,
             act_space = train_envs.single_action_space,
@@ -212,7 +212,15 @@ if __name__ == "__main__":
 
                 # log diffusion training stats
                 if trace and (losses is not None and losses_binned is not None and denoising_trace is not None):
-                    diffusion_diagnostics(retrain_idx, losses, losses_binned, denoising_trace, real_buffer, generator)
+                    diffusion_diagnostics(
+                        run_name=RUN_NAME, 
+                        retrain_idx=retrain_idx, 
+                        losses=losses, 
+                        losses_binned=losses_binned, 
+                        denoising_trace=denoising_trace, 
+                        real_buffer=real_buffer, 
+                        generator=generator
+                    )
                 retrain_idx += 1
                 
 
