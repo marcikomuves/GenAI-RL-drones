@@ -63,7 +63,7 @@ LOG_FREQ = 100  # log to tensorboard frequency in global steps
 # synthetic sampling
 SYNTHETIC_RATIO = 0.5 if ENABLE_SYNTHETIC else 0 # ratio of synthetic samples and the full SAC_BATCH_SIZE 
 SYNTHETIC_DENOISING_STEPS = 128 # for noise schedule
-SYNTHETIC_SAMPLES = 200_000 # number of synthetic transitions to sample after each synther retrain 
+SYNTHETIC_SAMPLES = 1_000_000 # number of synthetic transitions to sample after each synther retrain 
 SYNTHETIC_SAMPLE_BATCH_SIZE = 100_000  # break SYNTHETIC_SAMPLES into smaller chunks to prevent OOM
 
 # SynthER training
@@ -252,14 +252,15 @@ if __name__ == "__main__":
             # 2.3) policy network update
             if global_step % POLICY_FREQ == 0:
 
-                if ENABLE_SYNTHETIC and synthetic_buffer is not None:
-                    real = real_buffer.sample(int(SAC_BATCH_SIZE * (1.0 - SYNTHETIC_RATIO)))
-                    synthetic = synthetic_buffer.sample(int(SAC_BATCH_SIZE * SYNTHETIC_RATIO))
-                    data = {k: torch.cat([real[k], synthetic[k]], dim=0) for k in real}
-                else:
-                    data = real_buffer.sample(SAC_BATCH_SIZE)
-
                 for _ in range(POLICY_FREQ): # Compensate for the delay by doing POLICY_FREQ instead of 1
+
+                    if ENABLE_SYNTHETIC and synthetic_buffer is not None:
+                        real = real_buffer.sample(int(SAC_BATCH_SIZE * (1.0 - SYNTHETIC_RATIO)))
+                        synthetic = synthetic_buffer.sample(int(SAC_BATCH_SIZE * SYNTHETIC_RATIO))
+                        data = {k: torch.cat([real[k], synthetic[k]], dim=0) for k in real}
+                    else:
+                        data = real_buffer.sample(SAC_BATCH_SIZE)
+
                     pi, log_pi, _ = actor.get_action(data["obs"])
                     q_mean = torch.stack([qf.get_value(data["obs"], pi) for qf in qfs]).mean(0)
                     actor_loss = (alpha * log_pi - q_mean).mean()
