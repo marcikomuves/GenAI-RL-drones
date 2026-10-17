@@ -1,4 +1,5 @@
 import copy
+import os
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -288,7 +289,7 @@ class ElucidatedDiffusion(torch.nn.Module):
         self,
         batch_size: int = 16,
         num_sample_steps: Optional[int] = None,
-        clamp: bool = True,
+        clamp: bool = False,
         cond = None,
         trace = False,
         real_buffer_packed = None,
@@ -297,8 +298,9 @@ class ElucidatedDiffusion(torch.nn.Module):
     ):
 
         if trace:
+            assert w is not None and blocks is not None
             traced_values = []
-            idxs = torch.randperm(batch_size, device=x.device)[:max(1, 1024)]
+            idxs = torch.randperm(batch_size, device=self.device)[:min(1024, batch_size)]
 
         num_sample_steps = num_sample_steps if num_sample_steps is not None else self.num_sample_steps
         shape = (batch_size, *self.event_shape)
@@ -339,19 +341,12 @@ class ElucidatedDiffusion(torch.nn.Module):
                     w.add_scalar(f"sampling/{k}_std_real",  real_buffer_packed.std(0)[sl].mean(),    step)
 
                 # append the current noisy iterate and clean prediction tensors to a csv maybe
-                traced_values.append((
-                    (
-                        s, 
-                        x[idxs].cpu(), 
-                        x0_hat[idxs].cpu()
-                    ), 
-                    step)
-                )
+                traced_values.append((step,s,x[idxs].cpu(),x0_hat[idxs].cpu()))
 
         if trace:
             np.savez_compressed(
-            f"{w.get_logdir()}diagnostics.npz",
-            real_norm=real_buffer_packed,                                    # (N, dim), normalized space
+            os.path.join(w.get_logdir(), "diagnostics.npz"),
+            real_norm=real_buffer_packed[np.random.choice(len(real_buffer_packed), min(20000, len(real_buffer_packed)), replace=False)], # (N, dim), normalized space
             trace_steps=np.array([t[0] for t in traced_values]),
             trace_sigmas=np.array([t[1] for t in traced_values]),
             trace_x=np.stack([t[2].numpy() for t in traced_values]),    # noisy iterates
@@ -370,16 +365,15 @@ class SimpleDiffusionGenerator:
         obs_space,
         act_space,
         device,
-        terminal_threshold,
+        terminal_threshold = 0.5,
     ):
         self.obs_dim = obs_space.shape[0]
         self.act_dim = act_space.shape[0]
         self.dim = 2 * self.obs_dim + self.act_dim + 2
         self.device = device
         self.terminal_threshold = terminal_threshold
-        self.model = None
+        self.raw_model = None
         self.ema_model = None
-        self.actual_model = None
 
     def _pack(self, d):
         o, a = self.obs_dim, self.act_dim
@@ -405,6 +399,7 @@ class SimpleDiffusionGenerator:
         w = None
     ):
         if trace:
+            assert w is not None
             trace_batch = self._pack(real_buffer.sample(batch_size)).to(self.device)
         
         model = ElucidatedDiffusion(
@@ -425,6 +420,7 @@ class SimpleDiffusionGenerator:
             ),  
             event_shape = [self.dim],
         ).to(self.device)
+        self.raw_model = model
         self.ema_model = copy.deepcopy(model).requires_grad_(False)
         opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.99))
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, train_steps)
@@ -464,57 +460,69 @@ class SimpleDiffusionGenerator:
                             m = (sig >= edges[k]) & (sig <= edges[k + 1])
                             w.add_scalar(f"train/mse_bin{k}", float(per[m].mean().item()), step)                                    
 
-        self.model = self.ema_model.eval()
-        self.actual_model = self.model
+        self.raw_model.eval()
+        self.ema_model.eval()
 
-    
+
     def warm_retrain(
-        self,
-        real_buffer,
-        first_train_steps,
-        warm_retrain_steps,
-        batch_size,
-        lr
+        self, 
+        real_buffer, 
+        train_steps, 
+        batch_size, 
+        lr,
+        ema_freq=10, 
+        ema_decay=0.99, 
+        reset_normalizer=False,
+        trace=False, 
+        w=None
     ):
+        assert self.raw_model is not None
+        if trace:
+            assert w is not None
+            trace_batch = self._pack(real_buffer.sample(batch_size)).to(self.device)
 
-        if self.model is None:
-            train_steps = first_train_steps
-            self.model = ElucidatedDiffusion(
-                denoiser_net = ResidualMLPDenoiser(
-                    d_in=self.dim, 
-                    dim_t=256, 
-                    mlp_width=512, 
-                    num_layers=4,
-                    learned_sinusoidal_cond=False, 
-                    random_fourier_features=True,
-                    learned_sinusoidal_dim=16, 
-                    activation="relu", 
-                    layer_norm=True,
-                ), 
-                normalizer = Normalizer(
-                    dataset=self._pack(real_buffer.ordered()).cpu(), 
-                    skip_dims=[self.dim - 1]
-                ),  
-                event_shape = [self.dim],
-            ).to(self.device)
-        else:
-            train_steps = warm_retrain_steps
-            self.model.normalizer.reset(self._pack(real_buffer.ordered()).cpu())
-            self.model.normalizer.to(self.device)
-        opt = torch.optim.AdamW(self.model.parameters(), lr=lr, betas=(0.9, 0.99))
+        if reset_normalizer:
+            stats = self._pack(real_buffer.ordered()).cpu()
+            for m in (self.raw_model, self.ema_model):
+                m.normalizer.reset(stats)
+                m.normalizer.to(self.device)
+
+        opt = torch.optim.AdamW(self.raw_model.parameters(), lr=lr, betas=(0.9, 0.99))
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, train_steps)
-        self.model.train()
-        for step in tqdm(range(1, train_steps + 1), desc="[SynthER] Training step"):
+        self.raw_model.train()
+        pbar = tqdm(range(1, train_steps + 1), desc="[SynthER] Warm training step", mininterval=1, leave=False)
+        for step in pbar:
             data = self._pack(real_buffer.sample(batch_size)).to(self.device)
-            loss = self.model.forward(data)
+            loss = self.raw_model.forward(data)
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            opt.step(); sched.step()
+            torch.nn.utils.clip_grad_norm_(self.raw_model.parameters(), 1.0)
+            opt.step()
+            sched.step()
+            if step % ema_freq == 0:
+                with torch.no_grad():
+                    for pe, p in zip(self.ema_model.parameters(), self.raw_model.parameters()):
+                        pe.lerp_(p, 1 - ema_decay)
+                    for be, b in zip(self.ema_model.buffers(), self.raw_model.buffers()):
+                        be.copy_(b)
             if step % 1000 == 0:
-                print(f"[{step}/{train_steps}] loss: {loss.item():.4f}")
-        self.model.eval()
-        self.actual_model = self.model
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+                if trace:                   
+                    w.add_scalar("train/loss", loss.item(), step)
+                    with torch.no_grad():
+                        sig = self.raw_model.noise_distribution(len(trace_batch))
+                        x = self.raw_model.normalizer.normalize(trace_batch)
+                        noised = x + sig[:, None] * torch.randn_like(x)
+                        den = self.raw_model.preconditioned_forward(noised, sig)
+                        per = ((den - x) ** 2).mean(1)
+                        edges = torch.quantile(sig, torch.linspace(0, 1, 6, device=sig.device))
+                        for k in range(5):
+                            m = (sig >= edges[k]) & (sig <= edges[k + 1])
+                            w.add_scalar(f"train/mse_bin{k}", float(per[m].mean().item()), step) 
+
+        self.raw_model.eval()
+        self.ema_model.eval()
 
 
     @torch.no_grad()
@@ -527,18 +535,19 @@ class SimpleDiffusionGenerator:
         w = None,
         real_buffer = None
     ):
-        assert self.actual_model is not None, "call retrain() first"
+        assert self.ema_model is not None
 
         o, a, end = self.obs_dim, self.act_dim, self.dim - 1
 
         if trace:
+            assert w is not None and real_buffer is not None
             blocks = {
                 "obs": slice(0, o), 
                 "act": slice(o, o + a),
                 "rew": slice(o + a, o + a + 1), 
                 "delta": slice(o + a + 1, end)
             }
-            real_buffer_packed = self.actual_model.normalizer.normalize(self._pack(real_buffer.ordered())).cpu().numpy()
+            real_buffer_packed = self.ema_model.normalizer.normalize(self._pack(real_buffer.ordered()).to(self.device)).cpu().numpy()
         else:
             blocks = None
             real_buffer_packed = None
@@ -546,7 +555,7 @@ class SimpleDiffusionGenerator:
         sample_chunks = []
         for i, start in enumerate(range(0, num_samples, sample_batch_size)):
             n = min(sample_batch_size, num_samples - start)
-            sample_chunk = self.actual_model.sample(
+            sample_chunk = self.ema_model.sample(
                 batch_size=n, 
                 num_sample_steps=num_sample_steps, 
                 clamp=False,
@@ -564,6 +573,6 @@ class SimpleDiffusionGenerator:
         delta = s[:, o+a+1:2*o+a+1]
         term = s[:, -1]
         next_obs = obs + delta
-        if self.terminal_threshold is not None:
-            term = (term > self.terminal_threshold).astype(np.float32)
+        term = (term > self.terminal_threshold).astype(np.float32)
+
         return obs, act, rew, next_obs, term
