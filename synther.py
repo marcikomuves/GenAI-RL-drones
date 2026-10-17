@@ -1,8 +1,6 @@
-import os
 import copy
 import numpy as np
 import torch
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from typing import List, Optional, Sequence
 
@@ -291,10 +289,17 @@ class ElucidatedDiffusion(torch.nn.Module):
         batch_size: int = 16,
         num_sample_steps: Optional[int] = None,
         clamp: bool = True,
-        cond=None,
-        trace = False
+        cond = None,
+        trace = False,
+        real_buffer_packed = None,
+        w = None,
+        blocks = None
     ):
-               
+
+        if trace:
+            traced_values = []
+            idxs = torch.randperm(batch_size, device=x.device)[:max(1, 1024)]
+
         num_sample_steps = num_sample_steps if num_sample_steps is not None else self.num_sample_steps
         shape = (batch_size, *self.event_shape)
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
@@ -305,12 +310,6 @@ class ElucidatedDiffusion(torch.nn.Module):
         x = sigmas[0] * torch.randn(shape, device=self.device)
 
         # denoise
-        if trace:
-            trace_chunk = []
-            idxs = torch.randperm(batch_size, device=x.device)[:max(1, 1024)]
-        else:
-            trace_chunk = None
-
         pbar = tqdm(enumerate(zip(sigmas[:-1], sigmas[1:], gammas[:-1])), desc='[SynthER] Sampling time step', mininterval=1, leave=False)
         for step, (s, s_next, g) in pbar:
             s, s_next, g = s.item(), s_next.item(), g.item()
@@ -324,13 +323,23 @@ class ElucidatedDiffusion(torch.nn.Module):
                 x_next = x_hat + 0.5 * (s_next - s_hat) * (denoised_over_sigma + denoised_prime_over_sigma)
             x = x_next
 
-            # At 512 pre-selected indexes from the evolving batch log on every 8th denoising step: 
-            #   - sigma 
-            #   - the noisy iterate 
-            #   - the denoiser's current clean estimate
             if (step % 8 == 0 or step == num_sample_steps - 1) and trace:
+                w.add_scalar("sampling/sigma", s, step)
+
                 x0_hat = x_hat - s_hat * denoised_over_sigma
-                trace_chunk.append((
+
+                for k, sl in blocks.items():
+                    w.add_scalar(f"sampling/{k}_mean",      x0_hat.mean(0)[sl].mean(),                step)
+                    w.add_scalar(f"sampling/{k}_mean_min",  x0_hat.mean(0)[sl].min(),                 step)
+                    w.add_scalar(f"sampling/{k}_mean_max",  x0_hat.mean(0)[sl].max(),                 step)
+                    w.add_scalar(f"sampling/{k}_mean_real", real_buffer_packed.mean(0)[sl].mean(),   step)
+                    w.add_scalar(f"sampling/{k}_std",       x0_hat.std(0)[sl].mean(),                 step)   # drops the confusing "_mean_mean"
+                    w.add_scalar(f"sampling/{k}_std_min",   x0_hat.std(0)[sl].min(),                  step)
+                    w.add_scalar(f"sampling/{k}_std_max",   x0_hat.std(0)[sl].max(),                  step)
+                    w.add_scalar(f"sampling/{k}_std_real",  real_buffer_packed.std(0)[sl].mean(),    step)
+
+                # append the current noisy iterate and clean prediction tensors to a csv maybe
+                traced_values.append((
                     (
                         s, 
                         x[idxs].cpu(), 
@@ -339,9 +348,19 @@ class ElucidatedDiffusion(torch.nn.Module):
                     step)
                 )
 
+        if trace:
+            np.savez_compressed(
+            f"{w.get_logdir()}diagnostics.npz",
+            real_norm=real_buffer_packed,                                    # (N, dim), normalized space
+            trace_steps=np.array([t[0] for t in traced_values]),
+            trace_sigmas=np.array([t[1] for t in traced_values]),
+            trace_x=np.stack([t[2].numpy() for t in traced_values]),    # noisy iterates
+            trace_x0=np.stack([t[3].numpy() for t in traced_values]),   # clean estimates
+    )
+                
         if clamp:
             x = x.clamp(-1., 1.)
-        return self.normalizer.unnormalize(x), trace_chunk
+        return self.normalizer.unnormalize(x)
 
 
 class SimpleDiffusionGenerator:
@@ -383,14 +402,10 @@ class SimpleDiffusionGenerator:
         power,
         lr,
         trace = False,
+        w = None
     ):
         if trace:
             trace_batch = self._pack(real_buffer.sample(batch_size)).to(self.device)
-            losses = []
-            losses_binned = []
-        else:
-            losses = None
-            losses_binned = None
         
         model = ElucidatedDiffusion(
             denoiser_net = ResidualMLPDenoiser(
@@ -437,7 +452,7 @@ class SimpleDiffusionGenerator:
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
 
                 if trace:                   
-                    losses.append((loss.item(), step))
+                    w.add_scalar("train/loss", loss.item(), step)
                     with torch.no_grad():
                         sig = model.noise_distribution(len(trace_batch))
                         x = model.normalizer.normalize(trace_batch)
@@ -445,16 +460,12 @@ class SimpleDiffusionGenerator:
                         den = model.preconditioned_forward(noised, sig)
                         per = ((den - x) ** 2).mean(1)
                         edges = torch.quantile(sig, torch.linspace(0, 1, 6, device=sig.device))
-                        bins_at_step = []
                         for k in range(5):
                             m = (sig >= edges[k]) & (sig <= edges[k + 1])
-                            bins_at_step.append(per[m].mean().item())
-                        losses_binned.append((bins_at_step, step))
+                            w.add_scalar(f"train/mse_bin{k}", float(per[m].mean().item()), step)                                    
 
         self.model = self.ema_model.eval()
         self.actual_model = self.model
-
-        return losses, losses_binned
 
     
     def warm_retrain(
@@ -513,33 +524,40 @@ class SimpleDiffusionGenerator:
         num_sample_steps, 
         sample_batch_size,
         trace = False,
+        w = None,
+        real_buffer = None
     ):
         assert self.actual_model is not None, "call retrain() first"
 
+        o, a, end = self.obs_dim, self.act_dim, self.dim - 1
+
+        if trace:
+            blocks = {
+                "obs": slice(0, o), 
+                "act": slice(o, o + a),
+                "rew": slice(o + a, o + a + 1), 
+                "delta": slice(o + a + 1, end)
+            }
+            real_buffer_packed = self.actual_model.normalizer.normalize(self._pack(real_buffer.ordered())).cpu().numpy()
+        else:
+            blocks = None
+            real_buffer_packed = None
+
         sample_chunks = []
-        trace_chunks = []
-        for start in range(0, num_samples, sample_batch_size):
+        for i, start in enumerate(range(0, num_samples, sample_batch_size)):
             n = min(sample_batch_size, num_samples - start)
-            sample_chunk, trace_chunk = self.actual_model.sample(
+            sample_chunk = self.actual_model.sample(
                 batch_size=n, 
                 num_sample_steps=num_sample_steps, 
                 clamp=False,
-                trace=trace
+                trace=trace and i == 0,
+                real_buffer_packed=real_buffer_packed,
+                w=w,
+                blocks=blocks
             )
             sample_chunks.append(sample_chunk.cpu().numpy())
-            trace_chunks.append(trace_chunk)
         s = np.concatenate(sample_chunks, axis=0)
-        if trace:
-            trace_chunks_concat = []
-            for steps in zip(*trace_chunks): # steps = this step's entry from every chunk
-                (sigma, _, _), step_idx = steps[0]                 # same across chunks
-                x  = torch.cat([st[0][1] for st in steps], dim=0)
-                x0 = torch.cat([st[0][2] for st in steps], dim=0)
-                trace_chunks_concat.append((step_idx, sigma, x, x0))
-        else:
-            trace_chunks_concat = None
 
-        o, a = self.obs_dim, self.act_dim
         obs = s[:, :o]
         act = s[:, o:o + a]
         rew = s[:, o + a]
@@ -548,91 +566,4 @@ class SimpleDiffusionGenerator:
         next_obs = obs + delta
         if self.terminal_threshold is not None:
             term = (term > self.terminal_threshold).astype(np.float32)
-        return obs, act, rew, next_obs, term, trace_chunks_concat
-
-
-
-def diffusion_diagnostics(run_name, retrain_idx, losses, losses_binned, denoising_trace, real_buffer, generator):
-
-    def block_moments(real, synth, o, a, end):
-        real, synth = real[:, :end], synth[:, :end]
-        blocks = {
-            "obs": slice(0, o), 
-            "act": slice(o, o + a),
-            "rew": slice(o + a, o + a + 1), 
-            "delta": slice(o + a + 1, end)
-        }
-        out = {}
-        for k, s in blocks.items():
-            out[k] = dict(
-                synth_mean = (synth.mean(0)[s].mean(), synth.mean(0)[s].min(), synth.mean(0)[s].max()),
-                synth_std = (synth.std(0)[s].mean(), synth.std(0)[s].min(), synth.std(0)[s].max()),
-                real_mean = real.mean(0)[s].mean(), 
-                real_std = real.std(0)[s].mean()
-            )
-        return out
-
-    synther_runs_dir = f"runs/synther/{run_name}/retrain_{retrain_idx}/"
-    if not os.path.exists(synther_runs_dir):
-        os.makedirs(synther_runs_dir, exist_ok=True)
-    w = SummaryWriter(synther_runs_dir)
-
-    # Loss at each training step:
-    # The MSE between the model's output (result of the learned denoising) and the normalized target (batch of real samples)
-    for v, s in losses:
-        w.add_scalar("train/loss", v, s)
-
-    # Binned loss at each training step: 
-    # 1) Each sample in the batch gets its own sigma from the training distribution.
-    # 2) The sample is noised with its own sigma.
-    # 3) The model tries to denoise it knowing the sigma value.
-    # 4) Loss: the MSE of the denoised and the original sample batch 
-    # 5) Take the mean of these losses grouped by the sigma bin their sigma belongs to (5 groups of about 20% of the samples each):
-    #   @ 0: 
-    #       - tiny to 0.11: almost clean input  
-    #       - Shows shows how precisely the model reproduces a nearly clean sample. This is the regime that sets transition precision.
-    #   @ 1-3:  
-    #       - 0.11 to 0.22: low noise  
-    #       - 0.22 to 0.41: moderate
-    #       - 0.41 to 0.83: substantial noise
-    #       - Model quality shows up. A value that drops during training is real learning.
-    #   @ 4:  
-    #       - 0.83 to the largest drawn value (often 5 to 30+): heavy noise
-    #       - should plateau near 1, the per-dimension data variance in normalized space. With heavy noise, the best possible guess is close to the data mean
-    # 
-    # Expected to see decreasing values throughout training (mostly 1-3).
-    for bins, s in losses_binned:
-        for k, b in enumerate(bins):
-            w.add_scalar(f"train/mse_bin{k}", float(b), s)
-
-    with torch.no_grad():
-        packed = generator._pack(real_buffer.ordered())
-        sub = packed[torch.randperm(len(packed))[:20_000]].to(generator.device)
-        real_norm = generator.actual_model.normalizer.normalize(sub).cpu().numpy()
-
-    # Sampling process
-    o, a, end = generator.obs_dim, generator.act_dim, generator.dim - 1
-    for step, sigma, x, x0 in denoising_trace:
-        # sigma schedule from sampling trace (log-y)
-        w.add_scalar("sampling/sigma", sigma, step)
-
-        # plot how the sample's moments start to fit to the real dataset's moments over denoising steps
-        for k, d in block_moments(real_norm, x0.numpy(), o, a, end).items():
-            for stat in ("mean", "std"):
-                m, lo, hi = d[f"synth_{stat}"]
-                r = d[f"real_{stat}"]
-                w.add_scalar(f"sampling/{k}_{stat}",      m,  step)   # drops the confusing "_mean_mean"
-                w.add_scalar(f"sampling/{k}_{stat}_min",  lo, step)
-                w.add_scalar(f"sampling/{k}_{stat}_max",  hi, step)
-                w.add_scalar(f"sampling/{k}_{stat}_real", r,  step)
-
-    w.close()
-
-    np.savez_compressed(
-        f"{synther_runs_dir}diagnostics.npz",
-        real_norm=real_norm,                                    # (N, dim), normalized space
-        trace_steps=np.array([t[0] for t in denoising_trace]),
-        trace_sigmas=np.array([t[1] for t in denoising_trace]),
-        trace_x=np.stack([t[2].numpy() for t in denoising_trace]),    # noisy iterates
-        trace_x0=np.stack([t[3].numpy() for t in denoising_trace]),   # clean estimates
-    )
+        return obs, act, rew, next_obs, term
