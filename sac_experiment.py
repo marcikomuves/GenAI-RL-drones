@@ -10,7 +10,7 @@ from targetaviary import TargetAviary
 from targetstategenerator import StaticTargetStateGenerator
 from dronestategenerator import DroneStateGenerator
 from rolloutbuffer import RolloutBuffer
-from synther import SimpleDiffusionGenerator, diffusion_diagnostics
+from synther import SimpleDiffusionGenerator
 from sac import Actor, SoftQNetwork
 import argparse
 
@@ -63,7 +63,7 @@ LOG_FREQ = 100  # log to tensorboard frequency in global steps
 # synthetic sampling
 SYNTHETIC_RATIO = 0.5 if ENABLE_SYNTHETIC else 0 # ratio of synthetic samples and the full SAC_BATCH_SIZE 
 SYNTHETIC_DENOISING_STEPS = 128 # for noise schedule
-SYNTHETIC_SAMPLES = 200_000 # number of synthetic transitions to sample after each synther retrain 
+SYNTHETIC_SAMPLES = 1_000_000 # number of synthetic transitions to sample after each synther retrain 
 SYNTHETIC_SAMPLE_BATCH_SIZE = 100_000  # break SYNTHETIC_SAMPLES into smaller chunks to prevent OOM
 
 # SynthER training
@@ -176,6 +176,14 @@ if __name__ == "__main__":
             if ENABLE_SYNTHETIC and global_step >= SYNTHER_STARTS and global_step % SYNTHER_FREQ == 0:
 
                 trace = retrain_idx in trace_retrain_idxs
+
+                if trace:
+                    synther_runs_dir = f"runs/synther/{RUN_NAME}/retrain_{retrain_idx}/"
+                    if not os.path.exists(synther_runs_dir):
+                        os.makedirs(synther_runs_dir, exist_ok=True)
+                    w = SummaryWriter(synther_runs_dir)
+                else:
+                    w = None
                 
                 if synthetic_buffer is None:
                     synthetic_buffer = RolloutBuffer(
@@ -188,7 +196,7 @@ if __name__ == "__main__":
                 else:
                     synthetic_buffer.reset()
 
-                losses, losses_binned = generator.retrain(
+                generator.retrain(
                     real_buffer=real_buffer,
                     train_steps=SYNTHER_TRAIN_STEPS,
                     batch_size=SYNTHER_TRAIN_BATCH_SIZE,
@@ -197,30 +205,25 @@ if __name__ == "__main__":
                     ema_after=SYNTHER_EMA_AFTER,
                     beta=SYNTHER_EMA_BETA,
                     power=SYNTHER_EMA_POWER,
-                    trace=trace
+                    trace=trace,
+                    w=w
                 )
 
-                *transitions, denoising_trace = generator.sample(
+                transitions = generator.sample(
                     num_samples=SYNTHETIC_SAMPLES,
                     num_sample_steps=SYNTHETIC_DENOISING_STEPS,
                     sample_batch_size=SYNTHETIC_SAMPLE_BATCH_SIZE,
-                    trace=trace
+                    trace=trace,
+                    w=w,
+                    real_buffer=real_buffer
                 )
+
+                if trace:
+                    w.close()
 
                 for obs_synth, act_synth, reward_synth, next_obs_synth, terminated_synth in zip(*transitions):
                     synthetic_buffer.append(obs_synth, act_synth, reward_synth, terminated_synth, False, next_obs_synth)
 
-                # log diffusion training stats
-                if trace and (losses is not None and losses_binned is not None and denoising_trace is not None):
-                    diffusion_diagnostics(
-                        run_name=RUN_NAME, 
-                        retrain_idx=retrain_idx, 
-                        losses=losses, 
-                        losses_binned=losses_binned, 
-                        denoising_trace=denoising_trace, 
-                        real_buffer=real_buffer, 
-                        generator=generator
-                    )
                 retrain_idx += 1
                 
 
@@ -249,14 +252,15 @@ if __name__ == "__main__":
             # 2.3) policy network update
             if global_step % POLICY_FREQ == 0:
 
-                if ENABLE_SYNTHETIC and synthetic_buffer is not None:
-                    real = real_buffer.sample(int(SAC_BATCH_SIZE * (1.0 - SYNTHETIC_RATIO)))
-                    synthetic = synthetic_buffer.sample(int(SAC_BATCH_SIZE * SYNTHETIC_RATIO))
-                    data = {k: torch.cat([real[k], synthetic[k]], dim=0) for k in real}
-                else:
-                    data = real_buffer.sample(SAC_BATCH_SIZE)
-
                 for _ in range(POLICY_FREQ): # Compensate for the delay by doing POLICY_FREQ instead of 1
+
+                    if ENABLE_SYNTHETIC and synthetic_buffer is not None:
+                        real = real_buffer.sample(int(SAC_BATCH_SIZE * (1.0 - SYNTHETIC_RATIO)))
+                        synthetic = synthetic_buffer.sample(int(SAC_BATCH_SIZE * SYNTHETIC_RATIO))
+                        data = {k: torch.cat([real[k], synthetic[k]], dim=0) for k in real}
+                    else:
+                        data = real_buffer.sample(SAC_BATCH_SIZE)
+
                     pi, log_pi, _ = actor.get_action(data["obs"])
                     q_mean = torch.stack([qf.get_value(data["obs"], pi) for qf in qfs]).mean(0)
                     actor_loss = (alpha * log_pi - q_mean).mean()
