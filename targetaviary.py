@@ -39,7 +39,7 @@ class TargetAviary(BaseAviary):
         self.ANG_VEL_LIMIT = max_ang_vel
         self.MAX_SPEED_MPS = 0
         self.SPEED_LIMIT_MPS = 0
-        self.action_buffer = deque([np.zeros(4) for _ in range(3)], maxlen=3)
+        self.current_engine_cmd = np.zeros(4)
         
         super().__init__(
             drone_model=drone_model,
@@ -65,7 +65,7 @@ class TargetAviary(BaseAviary):
         )
     
 
-    def _observationSpace(self):
+    def _observationLimits(self):
         return spaces.Box(
             high=np.concatenate(
                 [
@@ -87,6 +87,9 @@ class TargetAviary(BaseAviary):
             ), 
             dtype=np.float32
         )
+
+    def _observationSpace(self):
+        return spaces.Box(-1, 1, (16,))
         
     
     def _computeObs(self):
@@ -110,13 +113,13 @@ class TargetAviary(BaseAviary):
                 e_v_body,
                 gravity_body,
                 ang_vel_body,
-                self.action_buffer[-1],
+                self.current_engine_cmd
             ], 
             axis=None
         )
 
         assert obs.shape == self.observation_space.shape
-        normalized_obs = obs/self.observation_space.high
+        normalized_obs = obs/self._observationLimits().high
         return np.clip(normalized_obs, -1.0, 1.0)
 
     def _computeReward(self):
@@ -144,8 +147,6 @@ class TargetAviary(BaseAviary):
         #r_upright = R[2, 2]
         # 4) penalize large angular velocities
         r_ang_vel = -0.1 * np.linalg.norm(ang_vel)
-        # 5) penalize large shifts in input
-        #r_act = -0.02 * np.sum(np.square(self.action_buffer[-1] - self.action_buffer[-2]))
         
 
         return (
@@ -153,7 +154,6 @@ class TargetAviary(BaseAviary):
             + r_progress
             #+ r_upright
             + r_ang_vel
-            #+ r_act
         )
     
 
@@ -207,9 +207,9 @@ class TargetAviary(BaseAviary):
     
 
     def step(self, action):
-        self.action_buffer.append(action.copy())
-        _, reward, terminated, truncated, info = super().step(action) # calls self._computeReward AFTER the simulation step
+        self.current_engine_cmd = action
         self.t += self.lookahead_dt
+        _, reward, terminated, truncated, info = super().step(action) # calls self._computeReward AFTER the simulation step
         return self._computeObs(), reward, terminated, truncated, info
     
 
@@ -218,6 +218,7 @@ class TargetAviary(BaseAviary):
         self.init_state_gen.reset(self.np_random)
         self.target_state_generator.reset(self.np_random)
         self.t = 0
+        self.current_engine_cmd = np.zeros(4)
         xyz, vel, rpy, ang_vel = self.init_state_gen.get()
         drone_id = self.getDroneIds()[0]
         p.resetBasePositionAndOrientation(
@@ -232,7 +233,7 @@ class TargetAviary(BaseAviary):
             angularVelocity=ang_vel.tolist(),
             physicsClientId=self.getPyBulletClient()
         )        
-        self.action_buffer = deque([np.zeros(4) for _ in range(3)], maxlen=3)
+        self._updateAndStoreKinematicInformation()
         if hasattr(self, "prev_dist"):
             del self.prev_dist
         return self._computeObs(), info

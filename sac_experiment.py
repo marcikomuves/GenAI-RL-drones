@@ -147,8 +147,7 @@ if __name__ == "__main__":
         generator = SimpleDiffusionGenerator(
             obs_space = train_envs.single_observation_space,
             act_space = train_envs.single_action_space,
-            device=device,
-            terminal_threshold=0.5,
+            device=device
         )
 
     obs, _ = train_envs.reset()

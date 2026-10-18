@@ -376,12 +376,11 @@ class SimpleDiffusionGenerator:
         self.ema_model = None
 
     def _pack(self, d):
-        o, a = self.obs_dim, self.act_dim
         return torch.cat([
-            d["obs"].reshape(-1, o),
-            d["action"].reshape(-1, a),
+            d["obs"].reshape(-1, self.obs_dim),
+            d["action"].reshape(-1, self.act_dim),
             d["reward"].reshape(-1, 1),
-            (d["next_obs"] - d["obs"]).reshape(-1, o), # diffusion over delta obs
+            (d["next_obs"] - d["obs"]).reshape(-1, self.obs_dim), # diffusion over delta obs
             d["terminated"].reshape(-1, 1).float(),
         ], dim=-1).float()
 
@@ -537,15 +536,13 @@ class SimpleDiffusionGenerator:
     ):
         assert self.ema_model is not None
 
-        o, a, end = self.obs_dim, self.act_dim, self.dim - 1
-
         if trace:
             assert w is not None and real_buffer is not None
             blocks = {
-                "obs": slice(0, o), 
-                "act": slice(o, o + a),
-                "rew": slice(o + a, o + a + 1), 
-                "delta": slice(o + a + 1, end)
+                "obs": slice(0, self.obs_dim), 
+                "act": slice(self.obs_dim, self.obs_dim + self.act_dim),
+                "rew": slice(self.obs_dim + self.act_dim, self.obs_dim + self.act_dim + 1), 
+                "delta": slice(self.obs_dim + self.act_dim + 1, self.dim - 1)
             }
             real_buffer_packed = self.ema_model.normalizer.normalize(self._pack(real_buffer.ordered()).to(self.device)).cpu().numpy()
         else:
@@ -554,9 +551,8 @@ class SimpleDiffusionGenerator:
 
         sample_chunks = []
         for i, start in enumerate(range(0, num_samples, sample_batch_size)):
-            n = min(sample_batch_size, num_samples - start)
             sample_chunk = self.ema_model.sample(
-                batch_size=n, 
+                batch_size=min(sample_batch_size, num_samples - start), 
                 num_sample_steps=num_sample_steps, 
                 clamp=False,
                 trace=trace and i == 0,
@@ -567,10 +563,10 @@ class SimpleDiffusionGenerator:
             sample_chunks.append(sample_chunk.cpu().numpy())
         s = np.concatenate(sample_chunks, axis=0)
 
-        obs = s[:, :o]
-        act = s[:, o:o + a]
-        rew = s[:, o + a]
-        delta = s[:, o+a+1:2*o+a+1]
+        obs = s[:, :self.obs_dim]
+        act = s[:, self.obs_dim:self.obs_dim + self.act_dim]
+        rew = s[:, self.obs_dim + self.act_dim]
+        delta = s[:, self.obs_dim+self.act_dim+1:2*self.obs_dim+self.act_dim+1]
         term = s[:, -1]
         next_obs = obs + delta
         term = (term > self.terminal_threshold).astype(np.float32)
