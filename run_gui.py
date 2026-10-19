@@ -1,4 +1,5 @@
 import sys, os
+import argparse
 import numpy as np
 import time
 import torch
@@ -6,10 +7,9 @@ import pybullet as p
 from gym_pybullet_drones.utils.enums import ActionType, DroneModel, Physics
 from gym_pybullet_drones.utils.utils import sync
 from gym_pybullet_drones.utils.Logger import Logger
-from trajectoryaviary import TrajectoryAviary
-from trajectorygenerator import StaticTrajectory, LinearTrajectory, CircleTrajectory, ZigZagTrajectory, SawtoothTrajectory
+from targetaviary import TargetAviary
+from targetstategenerator import *
 from dronestategenerator import DroneStateGenerator
-from ppo import Actor as PPOActor
 from sac import Actor as SACActor
 
 def draw_axes():
@@ -36,16 +36,13 @@ if sys.platform == "win32":
 
 if __name__ == "__main__":
 
-    try:
-        actor_type = sys.argv[1] 
-        policy_name = sys.argv[2]
-    except:
-        print("Invalid parameters.\n Usage: python run_gui.py [actor_type] [policy_name]")
-        sys.exit(-1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--policy-name", required=True)
+    args = parser.parse_args()
 
     # Create env
-    env = TrajectoryAviary(
-        trajectory_generator=StaticTrajectory(randomize=False),
+    env = TargetAviary(
+        target_state_generator=CircleTargetStateGenerator(),
         init_state_generator=DroneStateGenerator(init_xyz=INIT_XYZ, randomize=False),
         act=ACT, 
         max_t = 20,
@@ -61,16 +58,10 @@ if __name__ == "__main__":
     p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if actor_type == "ppo":
-        actor = PPOActor(act_space=env.action_space, obs_space=env.observation_space).to(device)
-    elif actor_type == "sac":
-        actor = SACActor(act_space=env.action_space, obs_space=env.observation_space).to(device)
-    else:
-        print("Invalid actor type.")
-        sys.exit(-1)
+    actor = SACActor(act_space=env.action_space, obs_space=env.observation_space).to(device)
 
-    if os.path.exists(policy_name):
-        actor.load_state_dict(torch.load(policy_name))
+    if os.path.exists(args.policy_name):
+        actor.load_state_dict(torch.load(args.policy_name))
     else:
         print("Policy path does not exist.")
         sys.exit(-1)
