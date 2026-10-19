@@ -63,7 +63,7 @@ LOG_FREQ = 100  # log to tensorboard frequency in global steps
 # synthetic sampling
 SYNTHETIC_RATIO = 0.5 if ENABLE_SYNTHETIC else 0 # ratio of synthetic samples and the full SAC_BATCH_SIZE 
 SYNTHETIC_DENOISING_STEPS = 128 # for noise schedule
-SYNTHETIC_SAMPLES = 1_000_000 # number of synthetic transitions to sample after each synther retrain 
+SYNTHETIC_SAMPLES = 200_000 # number of synthetic transitions to sample after each synther retrain 
 SYNTHETIC_SAMPLE_BATCH_SIZE = 100_000  # break SYNTHETIC_SAMPLES into smaller chunks to prevent OOM
 
 # SynthER training
@@ -147,8 +147,7 @@ if __name__ == "__main__":
         generator = SimpleDiffusionGenerator(
             obs_space = train_envs.single_observation_space,
             act_space = train_envs.single_action_space,
-            device=device,
-            terminal_threshold=0.5,
+            device=device
         )
 
     obs, _ = train_envs.reset()

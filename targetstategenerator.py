@@ -83,9 +83,6 @@ class CircleTargetStateGenerator(TargetStateGenerator):
         self.radius = radius
         self.speed = speed
 
-    def reset(self):
-        pass
-
     def get(self, t):
         x = self.radius * np.cos(self.speed * t)
         y = self.radius * np.sin(self.speed * t)
