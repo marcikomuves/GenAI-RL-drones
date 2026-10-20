@@ -2,7 +2,7 @@ import numpy as np
 
 class TargetStateGenerator:
 
-    def reset(self):
+    def reset(self, rng = None):
         pass
 
     def get(self, t):

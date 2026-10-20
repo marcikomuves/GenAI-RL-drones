@@ -61,7 +61,7 @@ if __name__ == "__main__":
     actor = SACActor(act_space=env.action_space, obs_space=env.observation_space).to(device)
 
     if os.path.exists(args.policy_name):
-        actor.load_state_dict(torch.load(args.policy_name))
+        actor.load_state_dict(torch.load(args.policy_name, map_location=device))
     else:
         print("Policy path does not exist.")
         sys.exit(-1)
