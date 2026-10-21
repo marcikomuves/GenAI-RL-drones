@@ -150,6 +150,7 @@ if __name__ == "__main__":
             device=device
         )
 
+    best_model_performance = 0
     obs, _ = train_envs.reset()
     pbar = tqdm(range(NUM_STEPS_TOTAL), desc="[SAC] Global step", mininterval=1, leave=False)
     for global_step in pbar:
@@ -319,8 +320,9 @@ if __name__ == "__main__":
                     stats["eval/eval_ep_length"] = ep_lengths.mean()
 
                     pbar.set_postfix(eval_ep_reward = f"{ep_rewards.mean():.4f}",)
-
-                    torch.save(actor.state_dict(), model_path)
+                    if(ep_rewards.mean() > best_model_performance):
+                        best_model_performance = ep_rewards.mean()
+                        torch.save(actor.state_dict(), model_path)
 
                 for key, value in stats.items():
                     writer.add_scalar(key, value, global_step/100)
