@@ -47,7 +47,7 @@ INIT_XYZ = np.array([0, 0, 1.0])
 NUM_TRAINING_ENVS = 1   # number of parallel training environments
 NUM_EVAL_ENVS = 6   # number of parallel evaluation environments
 NUM_STEPS_TOTAL = 100_000   # number of training episodes
-WARMUP_LENGTH = 5000    # warmup period length (action sampling without training)
+WARMUP_LENGTH = 10_000    # warmup period length (action sampling without training)
 REAL_BUFFER_SIZE = NUM_STEPS_TOTAL // NUM_TRAINING_ENVS
 SAC_BATCH_SIZE = 256    # number of transitions to sample for an update
 POLICY_LR = 3e-4    # learning rate of the policy network optimizer
@@ -105,6 +105,10 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); print(f"[INFO] {device}")
 
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    train_envs.single_action_space.seed(args.seed)
+
     qfs = []; qf_targets = []
     for i in range(N):
         qf = SoftQNetwork(train_envs.single_action_space, train_envs.single_observation_space, ENABLE_LAYERNORM).to(device)
@@ -151,7 +155,7 @@ if __name__ == "__main__":
         )
 
     best_model_performance = 0
-    obs, _ = train_envs.reset()
+    obs, _ = train_envs.reset(seed=args.seed)
     pbar = tqdm(range(NUM_STEPS_TOTAL), desc="[SAC] Global step", mininterval=1, leave=False)
     for global_step in pbar:
         actor.train()
@@ -239,7 +243,7 @@ if __name__ == "__main__":
 
                 with torch.no_grad():
                     next_state_actions, next_state_log_pi, _ = actor.get_action(data["next_obs"])
-                    idx = idx = np.random.choice(N, M, replace=False)             # M = 2 in REDQ, fresh draw every update
+                    idx = np.random.choice(N, M, replace=False)             # M = 2 in REDQ, fresh draw every update
                     q_next = torch.stack([qf_targets[i].get_value(data["next_obs"], next_state_actions) for i in idx]).min(0).values
                     y = data["reward"] + (1 - data["terminated"]) * GAMMA * (q_next - alpha * next_state_log_pi).view(-1)
                 q_vals = [qf.get_value(data["obs"], data["action"]).view(-1) for qf in qfs]
@@ -248,6 +252,11 @@ if __name__ == "__main__":
                 q_optimizer.zero_grad()
                 qf_loss.backward()
                 q_optimizer.step()
+
+                with torch.no_grad():
+                    for qf, qf_t in zip(qfs, qf_targets):
+                        for p, tp in zip(qf.parameters(), qf_t.parameters()):
+                            tp.data.mul_(1 - TAU).add_(TAU * p.data)
 
             # 2.3) policy network update
             if global_step % POLICY_FREQ == 0:
@@ -262,8 +271,9 @@ if __name__ == "__main__":
                         data = real_buffer.sample(SAC_BATCH_SIZE)
 
                     pi, log_pi, _ = actor.get_action(data["obs"])
-                    q_mean = torch.stack([qf.get_value(data["obs"], pi) for qf in qfs]).mean(0)
-                    actor_loss = (alpha * log_pi - q_mean).mean()
+                    q_pi_all = torch.stack([qf.get_value(data["obs"], pi) for qf in qfs])
+                    q_pi= q_pi_all.mean(0) if N == 10 else q_pi_all.min(0).values # distinction between REDQ and SAC
+                    actor_loss = (alpha * log_pi - q_pi).mean()
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     actor_optimizer.step()
@@ -277,13 +287,6 @@ if __name__ == "__main__":
                         alpha_loss.backward()
                         a_optimizer.step()
                         alpha = log_alpha.exp().item()
-
-            # 2.4) Update the target soft Q networks
-            if global_step % TARGET_FREQ == 0:
-                with torch.no_grad():
-                    for qf, qf_t in zip(qfs, qf_targets):
-                        for p, tp in zip(qf.parameters(), qf_t.parameters()):
-                            tp.data.mul_(1 - TAU).add_(TAU * p.data)
 
             # 3) Log stats
             if global_step % LOG_FREQ == 0:
