@@ -33,7 +33,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     env = TargetAviary(
-        target_state_generator=CircleTargetStateGenerator(),
+        target_state_generator=StaticTargetStateGenerator(),
         init_state_generator=DroneStateGenerator(init_xyz=INIT_XYZ, randomize=False),
         act=ACT, 
         max_t = 20,
