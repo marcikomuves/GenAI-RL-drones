@@ -26,21 +26,12 @@ INIT_XYZ = np.array([0, 0, 1.0])
 MAX_STEPS = 50_000
 RECORD = False
 
-# Force Windows High-DPI scaling awareness before creating the GUI
-if sys.platform == "win32":
-    import ctypes
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1) # 1 = Process_System_DPI_Aware
-    except Exception:
-        pass
-
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--policy-name", required=True)
     args = parser.parse_args()
 
-    # Create env
     env = TargetAviary(
         target_state_generator=CircleTargetStateGenerator(),
         init_state_generator=DroneStateGenerator(init_xyz=INIT_XYZ, randomize=False),
@@ -54,24 +45,17 @@ if __name__ == "__main__":
         record=RECORD
     )
 
-    # Hide all GUI panels
     p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     actor = SACActor(act_space=env.action_space, obs_space=env.observation_space).to(device)
 
-    if os.path.exists(args.policy_name):
-        actor.load_state_dict(torch.load(args.policy_name, map_location=device))
+    policy_path = os.path.join("models", "sac", args.policy_name, f"{args.policy_name}.cleanrl_model")
+    if os.path.exists(policy_path):
+        actor.load_state_dict(torch.load(policy_path, map_location=device))
     else:
-        print("Policy path does not exist.")
+        print(f"Policy path {policy_path} does not exist.")
         sys.exit(-1)
-
-    p.resetDebugVisualizerCamera(
-        cameraDistance=5.0,
-        cameraYaw=0,
-        cameraPitch=-89.999,
-        cameraTargetPosition=[0, 0, 1.0],
-    )
 
     actor.eval()
     obs, _ = env.reset()
@@ -79,7 +63,6 @@ if __name__ == "__main__":
     step_counter = 0
     start = time.time()
     for i in range(MAX_STEPS):
-        #obs_tensor = torch.Tensor(obs.reshape(env.observation_space.shape)).to(device)
         with torch.no_grad():
             _, _, action_mean = actor.get_action(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
         next_obs, _, terminated, truncated, _ = env.step(action_mean[0].cpu().numpy())
@@ -94,11 +77,10 @@ if __name__ == "__main__":
             step_counter = 0
 
         sync(step_counter, start, env.CTRL_TIMESTEP)
-        #drone_state, _ = env._getDroneStateVector(0), None
-        #p.resetDebugVisualizerCamera(
-        #    cameraDistance=2.0,
-        #    cameraYaw=-90,
-        #    cameraPitch=-30,
-        #    cameraTargetPosition=drone_state[:3],
-        #)
-
+        drone_state, _ = env._getDroneStateVector(0), None
+        p.resetDebugVisualizerCamera(
+            cameraDistance=2.0,
+            cameraYaw=-90,
+            cameraPitch=-30,
+            cameraTargetPosition=drone_state[:3],
+        )
