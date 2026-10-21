@@ -43,7 +43,7 @@ class StaticTargetStateGenerator(TargetStateGenerator):
             ])
 
     def get(self, t):
-        return self.xyz, np.zeros(3)
+        return self.xyz, np.zeros(3), np.zeros(3)
     
 class LinearTargetStateGenerator(TargetStateGenerator):
 
@@ -74,7 +74,7 @@ class LinearTargetStateGenerator(TargetStateGenerator):
            ])
 
     def get(self, t):
-        return self.p_0 + t * self.v, self.v
+        return self.p_0 + t * self.v, self.v, np.zeros(3)
 
     
 class CircleTargetStateGenerator(TargetStateGenerator):
@@ -84,32 +84,11 @@ class CircleTargetStateGenerator(TargetStateGenerator):
         self.speed = speed
 
     def get(self, t):
-        x = self.radius * np.cos(self.speed * t)
-        y = self.radius * np.sin(self.speed * t)
-        z = 1.0
+        w = self.speed
+        c, s = np.cos(w * t), np.sin(w * t)
 
-        vx = -self.radius * self.speed * np.sin(self.speed * t)
-        vy = self.radius * self.speed * np.cos(self.speed * t)
-        vz = 0.0
+        pos = np.array([self.radius * c, self.radius * s, 1.0])
+        vel = np.array([-self.radius * w * s, self.radius * w * c, 0.0])
+        acc = np.array([-self.radius * w**2 * c, -self.radius * w**2 * s, 0.0])  # centripetal: -ω² (pos - center)
 
-        return np.array([x, y, z]), np.array([vx, vy, vz])
-
-class SawtoothTargetStateGenerator(TargetStateGenerator):
-
-    def __init__(self, frequency=0.5, amplitude=np.array([1.0, 0.5, 0.0])):
-        self.freq = frequency
-        self.amp = amplitude
-
-    def get(self, t):
-        # Standard triangle wave formula: 2 * abs(2 * (t * f - floor(t * f + 0.5))) - 1
-        def tri(time, f):
-            return 2 * np.abs(2 * (time * f - np.floor(time * f + 0.5))) - 1
-        
-        # Derivative of triangle wave is a square wave
-        def tri_deriv(time, f):
-            return 4 * f * np.sign(np.cos(2 * np.pi * time * f))
-
-        pos = np.array([t * 0.5, tri(t, self.freq) * self.amp[1], 1.0])
-        vel = np.array([0.5, tri_deriv(t, self.freq) * self.amp[1], 0.0])
-        
-        return pos, vel
+        return pos, vel, acc 
